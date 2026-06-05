@@ -28,9 +28,9 @@ contract GasBenchmarkTest is Test {
 
     bytes k1Sig;
     bytes32 testHash;
-    bytes32 expectedK1OwnerId;
+    bytes32 expectedK1ActorId;
     bytes p256Data;
-    bytes32 expectedP256OwnerId;
+    bytes32 expectedP256ActorId;
     bytes delegateData;
 
     function setUp() public {
@@ -48,7 +48,7 @@ contract GasBenchmarkTest is Test {
             uint256 pk = 0xBEEF;
             (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, testHash);
             k1Sig = abi.encodePacked(r, s, v);
-            expectedK1OwnerId = bytes32(bytes20(vm.addr(pk)));
+            expectedK1ActorId = bytes32(bytes20(vm.addr(pk)));
         }
 
         // P256 data
@@ -57,22 +57,20 @@ contract GasBenchmarkTest is Test {
             (uint256 pubXu, uint256 pubYu) = vm.publicKeyP256(pk);
             (bytes32 r, bytes32 s) = vm.signP256(pk, testHash);
             p256Data = abi.encodePacked(r, s, bytes32(pubXu), bytes32(pubYu), uint8(0));
-            expectedP256OwnerId = keccak256(abi.encodePacked(bytes32(pubXu), bytes32(pubYu)));
+            expectedP256ActorId = keccak256(abi.encodePacked(bytes32(pubXu), bytes32(pubYu)));
         }
 
         // Delegate data
         {
             uint256 pkA = 0xA001;
             address signerA = vm.addr(pkA);
-            bytes32 ownerIdA = bytes32(bytes20(signerA));
-            IAccountConfiguration.Owner[] memory ownersA = new IAccountConfiguration.Owner[](1);
-            ownersA[0] = IAccountConfiguration.Owner({
-                ownerId: ownerIdA, config: IAccountConfiguration.OwnerConfig({verifier: address(k1), scopes: 0x00})
-            });
+            bytes32 actorIdA = bytes32(bytes20(signerA));
+            IAccountConfiguration.InitialActor[] memory actorsA = new IAccountConfiguration.InitialActor[](1);
+            actorsA[0] = IAccountConfiguration.InitialActor({actorId: actorIdA, verifier: address(k1)});
             bytes memory bytecode =
                 abi.encodePacked(hex"363d3d373d3d3d363d73", defaultImpl, hex"5af43d82803e903d91602b57fd5bf3");
-            config.createAccount(bytes32("benchA"), bytecode, ownersA);
-            address accountA = config.computeAddress(bytes32("benchA"), bytecode, ownersA);
+            config.createAccount(bytes32("benchA"), bytecode, actorsA);
+            address accountA = config.computeAddress(bytes32("benchA"), bytecode, actorsA);
             (uint8 v, bytes32 r, bytes32 s) = vm.sign(pkA, testHash);
             // Nested auth: k1Verifier(20) || sig
             bytes memory nestedAuth = abi.encodePacked(address(k1), r, s, v);

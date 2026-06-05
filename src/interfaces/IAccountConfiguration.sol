@@ -9,32 +9,48 @@ interface IAccountConfiguration {
 
     struct ChangeSequences {
         uint64 multichain; // chain_id 0
-        uint64 local; // chain_id == block.chainid
+        uint64 local; // chain_id == block.chainid; starts at 1 once initialized (created/imported), 0 = uninitialized
     }
 
-    struct OwnerConfig {
+    struct ActorConfig {
         address verifier;
-        uint8 scopes;
+        uint8 scope;
+        uint48 expiry; // Unix seconds; 0 = no expiry. Actor invalid once block.timestamp > expiry
+        uint8 policyType; // 0x00 = none; any non-zero = gated to stored manager (value interpreted by the manager)
     }
 
-    struct Owner {
-        bytes32 ownerId;
-        OwnerConfig config;
+    // Minimal actor used for account creation and import (always unrestricted: scope=0x00, policyType=0x00, no expiry).
+    struct InitialActor {
+        bytes32 actorId;
+        address verifier;
     }
 
-    struct OwnerChange {
-        bytes32 ownerId;
-        uint8 changeType; // 0x01 = authorizeOwner, 0x02 = revokeOwner
-        bytes configData; // OwnerConfig for authorize, empty for revoke
+    struct Actor {
+        bytes32 actorId;
+        ActorConfig config;
+        // Sliced by policyType: empty (0x00); manager[20] || commitment[32] (non-zero).
+        bytes policyData;
+    }
+
+    struct ActorChange {
+        uint8 changeType; // 0x01 = authorizeActor, 0x02 = revokeActor
+        bytes32 actorId;
+        bytes data; // operation-specific: ActorConfig || policyData for authorize, empty for revoke
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     // EVENTS
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    event OwnerAuthorized(address indexed account, bytes32 indexed ownerId, OwnerConfig config);
+    event ActorAuthorized(
+        address indexed account,
+        bytes32 indexed actorId,
+        ActorConfig config,
+        address policyManager,
+        bytes32 policyCommitment
+    );
 
-    event OwnerRevoked(address indexed account, bytes32 indexed ownerId);
+    event ActorRevoked(address indexed account, bytes32 indexed actorId);
 
     event AccountCreated(address indexed account, bytes32 userSalt, bytes32 codeHash);
 
@@ -51,16 +67,16 @@ interface IAccountConfiguration {
     // FUNCTIONS
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    function createAccount(bytes32 userSalt, bytes calldata bytecode, Owner[] calldata initialOwners)
+    function createAccount(bytes32 userSalt, bytes calldata bytecode, InitialActor[] calldata initialActors)
         external
         returns (address);
 
-    function importAccount(address account, Owner[] calldata initialOwners, bytes calldata signature) external;
+    function importAccount(address account, InitialActor[] calldata initialActors, bytes calldata signature) external;
 
-    function applySignedOwnerChanges(
+    function applySignedActorChanges(
         address account,
         uint64 chainId,
-        OwnerChange[] calldata ownerChanges,
+        ActorChange[] calldata actorChanges,
         bytes calldata auth
     ) external;
 
@@ -77,10 +93,10 @@ interface IAccountConfiguration {
         view
         returns (bool verified);
 
-    function verify(address account, bytes32 hash, bytes calldata auth) external view returns (uint8 scopes);
+    function verifyActor(address account, bytes32 hash, bytes calldata auth) external view returns (uint8 scope);
 
     // Account creation
-    function computeAddress(bytes32 userSalt, bytes calldata bytecode, Owner[] calldata initialOwners)
+    function computeAddress(bytes32 userSalt, bytes calldata bytecode, InitialActor[] calldata initialActors)
         external
         view
         returns (address);
@@ -89,11 +105,13 @@ interface IAccountConfiguration {
     // STORAGE VIEWS
     // ----------------------------------------------------------------------------------------------------------------
 
-    function isInitialized(address account) external view returns (bool);
+    function isActor(address account, bytes32 actorId) external view returns (bool);
 
-    function isOwner(address account, bytes32 ownerId) external view returns (bool);
+    function getActorConfig(address account, bytes32 actorId) external view returns (ActorConfig memory);
 
-    function getOwnerConfig(address account, bytes32 ownerId) external view returns (OwnerConfig memory);
+    /// @notice Resolves the policy gate target and signed commitment for an actor:
+    ///         0x00 -> (address(0), bytes32(0)); non-zero -> (manager, commitment).
+    function getPolicy(address account, bytes32 actorId) external view returns (address target, bytes32 commitment);
 
     function getChangeSequences(address account) external view returns (ChangeSequences memory);
 

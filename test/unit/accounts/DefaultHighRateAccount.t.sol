@@ -20,7 +20,7 @@ contract HighRateMockTarget {
 }
 
 contract DefaultHighRateAccountTest is AccountConfigurationTest {
-    uint256 constant OWNER_PK = 100;
+    uint256 constant ACTOR_PK = 100;
     HighRateMockTarget public target;
     address public highRateImplementation;
 
@@ -30,17 +30,15 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
         highRateImplementation = address(new DefaultHighRateAccount(address(accountConfiguration)));
     }
 
-    function _createHighRateK1Account(uint256 pk) internal returns (address account, bytes32 ownerId) {
+    function _createHighRateK1Account(uint256 pk) internal returns (address account, bytes32 actorId) {
         address signer = vm.addr(pk);
-        ownerId = bytes32(bytes20(signer));
+        actorId = bytes32(bytes20(signer));
 
-        IAccountConfiguration.Owner[] memory owners = new IAccountConfiguration.Owner[](1);
-        owners[0] = IAccountConfiguration.Owner({
-            ownerId: ownerId, config: IAccountConfiguration.OwnerConfig({verifier: address(k1Verifier), scopes: 0x00})
-        });
+        IAccountConfiguration.InitialActor[] memory actors = new IAccountConfiguration.InitialActor[](1);
+        actors[0] = IAccountConfiguration.InitialActor({actorId: actorId, verifier: address(k1Verifier)});
 
         bytes memory bytecode = _computeERC1167Bytecode(highRateImplementation);
-        account = accountConfiguration.createAccount(bytes32(uint256(0xbeef)), bytecode, owners);
+        account = accountConfiguration.createAccount(bytes32(uint256(0xbeef)), bytecode, actors);
     }
 
     function _lockAccount(address account, uint16 unlockDelay) internal {
@@ -56,7 +54,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     // ── executeBatch ──
 
     function test_executeBatch_success() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         vm.prank(account);
         DefaultHighRateAccount(payable(account))
@@ -66,7 +64,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_withETHValue() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
         vm.deal(account, 1 ether);
 
         vm.prank(account);
@@ -77,7 +75,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_multipleCalls() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
         HighRateMockTarget target2 = new HighRateMockTarget();
 
         Call[] memory calls = new Call[](2);
@@ -92,7 +90,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_revertsFromNonSelf() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         vm.prank(address(0xdead));
         vm.expectRevert();
@@ -101,7 +99,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_revertsOnFailedCall() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         vm.prank(account);
         vm.expectRevert();
@@ -110,7 +108,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_blocksETHWhenLocked() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
         vm.deal(account, 1 ether);
 
         _lockAccount(account, 1 hours);
@@ -122,7 +120,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_allowsZeroValueCallsWhenLocked() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         _lockAccount(account, 1 hours);
 
@@ -134,7 +132,7 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     }
 
     function test_executeBatch_allowsETHWhenUnlocked() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
         vm.deal(account, 1 ether);
 
         vm.prank(account);
@@ -147,17 +145,17 @@ contract DefaultHighRateAccountTest is AccountConfigurationTest {
     // ── isValidSignature ──
 
     function test_isValidSignature_validK1() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         bytes32 hash = keccak256("validate me");
-        bytes memory authData = _buildK1Auth(OWNER_PK, hash);
+        bytes memory authData = _buildK1Auth(ACTOR_PK, hash);
 
         bytes4 result = DefaultHighRateAccount(payable(account)).isValidSignature(hash, authData);
         assertEq(result, bytes4(0x1626ba7e));
     }
 
     function test_isValidSignature_invalidSignature() public {
-        (address account,) = _createHighRateK1Account(OWNER_PK);
+        (address account,) = _createHighRateK1Account(ACTOR_PK);
 
         bytes32 hash = keccak256("validate me");
         bytes memory authData = _buildK1Auth(999, hash);
