@@ -60,13 +60,54 @@ contract PolicyManagerTest is AccountConfigurationTest {
         manager.execute(address(policy), _action());
     }
 
+    function test_execute_revertsForCrossAccountCommitmentReuse() public {
+        // Victim installs a binding for itself; record.account = victim. Note: AccountConfiguration stores the
+        // commitment as opaque bytes, so an attacker can register an actor on their *own* account that points at the
+        // victim's commitment value + this manager. The manager must reject when the executing account is not the
+        // one the binding was installed for, otherwise the attacker could drive (and exhaust) the victim's
+        // commitment-keyed policy state — e.g. a shared spend counter.
+        bytes32 victimActorId = _installSession(1);
+        bytes32 victimCommitment = ACCOUNT_CONFIGURATION_commitment(victimActorId);
+
+        // Build an attacker account that "authorizes" an actor with the victim's commitment value and this manager.
+        (address attacker, uint256 attackerOwnerPk) = _createAttackerAccount();
+        bytes32 attackerActorId = keccak256(abi.encode("attacker-session", uint256(1)));
+        _authorizePolicyActorOn(attacker, attackerOwnerPk, attackerActorId, victimCommitment);
+
+        _mockActingActor(attackerActorId);
+        vm.expectRevert(abi.encodeWithSelector(PolicyManager.CommitmentAccountMismatch.selector, account, attacker));
+        vm.prank(attacker);
+        manager.execute(address(policy), _action());
+    }
+
     // ── Install authorization ──
 
-    function test_install_revertsForNonAccountCaller() public {
+    function test_install_isPermissionless_anyCallerForAuthorizedBinding() public {
+        // Install is gated by the account's signed commitment, not by msg.sender: once the account has authorized the
+        // actor's commitment, a third party (e.g. a subscription provider) can submit the install itself.
         PolicyManager.PolicyBinding memory binding = _binding(1);
-        vm.expectRevert(abi.encodeWithSelector(PolicyManager.UnauthorizedAccount.selector, stranger, account));
+        bytes32 actorId = _sessionActorId(1);
+        bytes32 commitment = manager.commitmentOf(binding);
+        _authorizePolicyActor(actorId, commitment);
+
         vm.prank(stranger);
-        manager.install(bytes32(0), binding);
+        manager.install(actorId, binding);
+
+        assertTrue(manager.getPolicyRecord(address(policy), commitment).installed);
+    }
+
+    function test_install_revertsWhenAlreadyInstalled() public {
+        // One-shot per commitment: re-installing the same binding cannot reset its accounting.
+        PolicyManager.PolicyBinding memory binding = _binding(1);
+        bytes32 actorId = _sessionActorId(1);
+        bytes32 commitment = manager.commitmentOf(binding);
+        _authorizePolicyActor(actorId, commitment);
+        vm.prank(account);
+        manager.install(actorId, binding);
+
+        vm.expectRevert(abi.encodeWithSelector(PolicyManager.PolicyAlreadyInstalled.selector, commitment));
+        vm.prank(account);
+        manager.install(actorId, binding);
     }
 
     function test_install_revertsWhenCommitmentNotAuthorized() public {
@@ -165,6 +206,46 @@ contract PolicyManagerTest is AccountConfigurationTest {
         uint64 sequence = accountConfiguration.getChangeSequences(account).local;
         bytes32 digest = _computeActorChangeBatchDigest(account, chainId, sequence, changes);
         accountConfiguration.applySignedActorChanges(account, chainId, changes, _buildK1Auth(ROOT_PK, digest));
+    }
+
+    function ACCOUNT_CONFIGURATION_commitment(bytes32 actorId) internal view returns (bytes32) {
+        return accountConfiguration.getPolicyCommitment(account, actorId);
+    }
+
+    /// @dev Build a second account owned by a distinct root key (the "attacker"), with this manager registered as
+    ///      an execution-enabled actor (`EXTERNAL_CALLER_AUTHENTICATOR`).
+    function _createAttackerAccount() internal returns (address attacker, uint256 attackerOwnerPk) {
+        attackerOwnerPk = 0xB0B;
+        IAccountConfiguration.InitialActor memory root = IAccountConfiguration.InitialActor({
+            actorId: bytes32(bytes20(vm.addr(attackerOwnerPk))), authenticator: address(k1Authenticator)
+        });
+        IAccountConfiguration.InitialActor memory mgr = IAccountConfiguration.InitialActor({
+            actorId: bytes32(bytes20(address(manager))), authenticator: EXTERNAL_CALLER_AUTHENTICATOR
+        });
+        IAccountConfiguration.InitialActor[] memory actors = new IAccountConfiguration.InitialActor[](2);
+        (actors[0], actors[1]) = root.actorId < mgr.actorId ? (root, mgr) : (mgr, root);
+
+        bytes memory bytecode = _computeERC1167Bytecode(defaultAccountImplementation);
+        attacker = accountConfiguration.createAccount(bytes32(uint256(0xA77ACE2)), bytecode, actors);
+    }
+
+    /// @dev Variant of {_authorizePolicyActor} that operates on an arbitrary `target` account signed by its owner.
+    ///      Used to register a victim's commitment value on a different account — the cross-account reuse case.
+    function _authorizePolicyActorOn(address target_, uint256 ownerPk, bytes32 actorId, bytes32 commitment) internal {
+        IAccountConfiguration.ActorConfig memory cfg = IAccountConfiguration.ActorConfig({
+            authenticator: address(k1Authenticator), scope: SCOPE_SENDER, expiry: 0, policyType: POLICY_GATED
+        });
+        bytes memory policyData = abi.encodePacked(address(manager), commitment);
+
+        IAccountConfiguration.ActorChange[] memory changes = new IAccountConfiguration.ActorChange[](1);
+        changes[0] = IAccountConfiguration.ActorChange({
+            actorId: actorId, changeType: AUTHORIZE_ACTOR, data: abi.encode(cfg, policyData)
+        });
+
+        uint64 chainId = uint64(block.chainid);
+        uint64 sequence = accountConfiguration.getChangeSequences(target_).local;
+        bytes32 digest = _computeActorChangeBatchDigest(target_, chainId, sequence, changes);
+        accountConfiguration.applySignedActorChanges(target_, chainId, changes, _buildK1Auth(ownerPk, digest));
     }
 
     function _revokePolicyActor(bytes32 actorId) internal {
