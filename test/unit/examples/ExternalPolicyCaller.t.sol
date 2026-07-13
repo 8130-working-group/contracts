@@ -38,8 +38,8 @@ contract ExternalPolicyCallerTest is AccountConfigurationTest {
     address internal recipient = address(0x5EE);
 
     uint256 internal constant ROOT_PK = 0xA11CE;
-    uint8 internal constant SCOPE_SENDER = 0x02;
-    uint8 internal constant POLICY_GATED = 0x01;
+    uint8 internal constant SCOPE_SENDER = 0x01;
+    uint8 internal constant SCOPE_POLICY = 0x02;
     uint8 internal constant AUTHORIZE_ACTOR = 0x01;
     uint8 internal constant REVOKE_ACTOR = 0x02;
 
@@ -90,12 +90,34 @@ contract ExternalPolicyCallerTest is AccountConfigurationTest {
         binding; // silence unused
     }
 
+    function test_executeFor_revertsWhenCommitmentZero() public {
+        // The account gated the provider to *this* manager but with a zero (empty) commitment. The manager-match
+        // passes, but the live commitment read resolves to zero, so there is no binding to enforce.
+        address account = _createAccount(bytes32(uint256(1)));
+        _authorizeProvider(account, address(manager), bytes32(0));
+
+        vm.expectRevert(abi.encodeWithSelector(PolicyManager.NoActivePolicy.selector, bytes32(bytes20(provider))));
+        vm.prank(provider);
+        manager.executeFor(account, address(policy), _pull(1));
+    }
+
     function test_executeFor_revertsAfterRevoke() public {
         address account = _optIn(bytes32(uint256(1)), 100e6, MONTH);
 
         _revokeProvider(account);
 
         vm.expectRevert(abi.encodeWithSelector(PolicyManager.NoActivePolicy.selector, bytes32(bytes20(provider))));
+        vm.prank(provider);
+        manager.executeFor(account, address(policy), _pull(1));
+    }
+
+    function test_executeFor_revertsWhenActorExpired() public {
+        // External path has no protocol auth, so expiry must be enforced in the manager.
+        uint48 expiry = uint48(block.timestamp + 1 days);
+        address account = _optInWithExpiry(bytes32(uint256(1)), 100e6, MONTH, expiry);
+
+        vm.warp(uint256(expiry) + 1);
+        vm.expectRevert(abi.encodeWithSelector(PolicyManager.ActorExpired.selector, bytes32(bytes20(provider))));
         vm.prank(provider);
         manager.executeFor(account, address(policy), _pull(1));
     }
@@ -205,13 +227,14 @@ contract ExternalPolicyCallerTest is AccountConfigurationTest {
         );
     }
 
-    /// @dev SessionPolicy config: allow any selector on `token`, with a USDC-style recurring spend limit.
+    /// @dev SessionPolicy config: `transfer` only on `token`, with a USDC-style recurring spend limit.
     function _config(uint256 limit, uint40 period) internal view returns (bytes memory) {
         SessionPolicy.TokenLimit[] memory limits = new SessionPolicy.TokenLimit[](1);
         limits[0] = SessionPolicy.TokenLimit({token: address(token), limit: limit, period: period});
+        SessionPolicy.SelectorRule[] memory rules = new SessionPolicy.SelectorRule[](1);
+        rules[0] = SessionPolicy.SelectorRule({selector: ExtMockERC20.transfer.selector, recipients: new address[](0)});
         SessionPolicy.CallScope[] memory scopes = new SessionPolicy.CallScope[](1);
-        scopes[0] =
-            SessionPolicy.CallScope({target: address(token), selectorRules: new SessionPolicy.SelectorRule[](0)});
+        scopes[0] = SessionPolicy.CallScope({target: address(token), selectorRules: rules});
         return abi.encode(SessionPolicy.Config({tokenLimits: limits, callScopes: scopes}));
     }
 
@@ -234,20 +257,30 @@ contract ExternalPolicyCallerTest is AccountConfigurationTest {
     /// @dev Full opt-in for one subscriber: create the account, mint it tokens, authorize the provider as an
     ///      external-policy actor gated to this manager, and install the binding.
     function _optIn(bytes32 accountSalt, uint256 limit, uint40 period) internal returns (address account) {
+        return _optInWithExpiry(accountSalt, limit, period, 0);
+    }
+
+    function _optInWithExpiry(bytes32 accountSalt, uint256 limit, uint40 period, uint48 expiry)
+        internal
+        returns (address account)
+    {
         account = _createAccount(accountSalt);
         (PolicyManager.PolicyBinding memory binding, bytes32 commitment) =
             _binding(account, uint256(accountSalt), limit, period);
-        _authorizeProvider(account, address(manager), commitment);
+        _authorizeProvider(account, address(manager), commitment, expiry);
         vm.prank(account);
         manager.install(bytes32(bytes20(provider)), binding);
     }
 
     function _createAccount(bytes32 salt) internal returns (address account) {
         AccountConfiguration.InitialActor memory root = AccountConfiguration.InitialActor({
-            actorId: bytes32(bytes20(vm.addr(ROOT_PK))), authenticator: address(k1Authenticator)
+            actorId: bytes32(bytes20(vm.addr(ROOT_PK))),
+            authenticator: address(k1Authenticator),
+            scope: 0,
+            policyData: ""
         });
         AccountConfiguration.InitialActor memory mgr = AccountConfiguration.InitialActor({
-            actorId: bytes32(bytes20(address(manager))), authenticator: TRUSTED_EXECUTOR
+            actorId: bytes32(bytes20(address(manager))), authenticator: TRUSTED_EXECUTOR, scope: 0, policyData: ""
         });
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](2);
         (actors[0], actors[1]) = root.actorId < mgr.actorId ? (root, mgr) : (mgr, root);
@@ -260,8 +293,12 @@ contract ExternalPolicyCallerTest is AccountConfigurationTest {
     /// @dev Authorize the provider as an external-policy actor: no direct authority, gated to `policyManager` with
     ///      `commitment`. The actorId is the provider's own address.
     function _authorizeProvider(address account, address policyManager, bytes32 commitment) internal {
+        _authorizeProvider(account, policyManager, commitment, 0);
+    }
+
+    function _authorizeProvider(address account, address policyManager, bytes32 commitment, uint48 expiry) internal {
         AccountConfiguration.ActorConfig memory cfg = AccountConfiguration.ActorConfig({
-            authenticator: EXTERNAL_POLICY_AUTHENTICATOR, scope: SCOPE_SENDER, expiry: 0, policyType: POLICY_GATED
+            authenticator: EXTERNAL_POLICY_AUTHENTICATOR, scope: SCOPE_POLICY, expiry: expiry
         });
         AccountConfiguration.ActorChange[] memory changes = new AccountConfiguration.ActorChange[](1);
         changes[0] = AccountConfiguration.ActorChange({

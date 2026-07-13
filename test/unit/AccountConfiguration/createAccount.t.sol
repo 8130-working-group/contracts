@@ -16,7 +16,9 @@ contract CreateAccountTest is AccountConfigurationTest {
         pure
         returns (AccountConfiguration.InitialActor memory)
     {
-        return AccountConfiguration.InitialActor({actorId: actorId, authenticator: authenticator});
+        return AccountConfiguration.InitialActor({
+            actorId: actorId, authenticator: authenticator, scope: 0, policyData: ""
+        });
     }
 
     /// @dev A one-element k1 actor set with a caller-chosen actorId. actorId must be strictly > 0 (the sort guard
@@ -243,7 +245,6 @@ contract CreateAccountTest is AccountConfigurationTest {
         assertEq(cfg.authenticator, authenticator);
         assertEq(cfg.scope, 0x00);
         assertEq(cfg.expiry, 0);
-        assertEq(cfg.policyType, 0x00);
         assertTrue(accountConfiguration.isActor(account, actorId));
     }
 
@@ -263,7 +264,6 @@ contract CreateAccountTest is AccountConfigurationTest {
         assertEq(cfg.authenticator, address(k1Authenticator));
         assertEq(cfg.scope, 0x00);
         assertEq(cfg.expiry, 0);
-        assertEq(cfg.policyType, 0x00);
 
         assertEq(accountConfiguration.getChangeSequences(account).local, 1);
         assertEq(accountConfiguration.getChangeSequences(account).multichain, 0);

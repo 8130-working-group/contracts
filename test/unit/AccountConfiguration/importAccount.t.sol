@@ -52,13 +52,12 @@ contract ImportAccountTest is AccountConfigurationTest {
     // retains the full Actor/ActorConfig typehash structure; for imported (always unrestricted) actors the config
     // fields are zero and policyData is empty.
     bytes32 constant ACTOR_INITIALIZATION_TYPEHASH = keccak256(
-        "ActorInitialization(bytes32 salt,uint256 chainId,Actor[] initialActors)Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint8 scope,uint48 expiry,uint8 policyType)"
+        "ActorInitialization(bytes32 salt,uint256 chainId,Actor[] initialActors)Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint8 scope,uint48 expiry)"
     );
     bytes32 constant ACTOR_TYPEHASH = keccak256(
-        "Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint8 scope,uint48 expiry,uint8 policyType)"
+        "Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint8 scope,uint48 expiry)"
     );
-    bytes32 constant ACTORCONFIG_TYPEHASH =
-        keccak256("ActorConfig(address authenticator,uint8 scope,uint48 expiry,uint8 policyType)");
+    bytes32 constant ACTORCONFIG_TYPEHASH = keccak256("ActorConfig(address authenticator,uint8 scope,uint48 expiry)");
 
     // ── digest helpers ──
 
@@ -78,10 +77,13 @@ contract ImportAccountTest is AccountConfigurationTest {
     ) internal pure returns (bytes32) {
         bytes32[] memory actorHashes = new bytes32[](initialActors.length);
         for (uint256 i; i < initialActors.length; i++) {
+            // Hash the actor's real scope; expiry is always 0 at import. policyData is hashed into the Actor hash.
             bytes32 configHash = keccak256(
-                abi.encode(ACTORCONFIG_TYPEHASH, initialActors[i].authenticator, uint8(0), uint48(0), uint8(0))
+                abi.encode(ACTORCONFIG_TYPEHASH, initialActors[i].authenticator, initialActors[i].scope, uint48(0))
             );
-            actorHashes[i] = keccak256(abi.encode(ACTOR_TYPEHASH, initialActors[i].actorId, configHash, keccak256("")));
+            actorHashes[i] = keccak256(
+                abi.encode(ACTOR_TYPEHASH, initialActors[i].actorId, configHash, keccak256(initialActors[i].policyData))
+            );
         }
         return keccak256(
             abi.encode(
@@ -102,7 +104,7 @@ contract ImportAccountTest is AccountConfigurationTest {
     {
         actors = new AccountConfiguration.InitialActor[](1);
         actors[0] = AccountConfiguration.InitialActor({
-            actorId: bytes32(bytes20(signer)), authenticator: address(k1Authenticator)
+            actorId: bytes32(bytes20(signer)), authenticator: address(k1Authenticator), scope: 0, policyData: ""
         });
     }
 
@@ -116,7 +118,10 @@ contract ImportAccountTest is AccountConfigurationTest {
         actors = new AccountConfiguration.InitialActor[](count);
         for (uint256 i; i < count; i++) {
             actors[i] = AccountConfiguration.InitialActor({
-                actorId: bytes32(bytes20(address(uint160(base + i)))), authenticator: address(k1Authenticator)
+                actorId: bytes32(bytes20(address(uint160(base + i)))),
+                authenticator: address(k1Authenticator),
+                scope: 0,
+                policyData: ""
             });
         }
     }
@@ -142,21 +147,22 @@ contract ImportAccountTest is AccountConfigurationTest {
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
     /// @notice Verifies importAccount reverts when the account is hard-locked (onlyUnlocked runs before all else).
-    /// @dev lock() sets unlocksAt = type(uint40).max, so the account stays locked regardless of warp; any non-zero
-    ///      unlock delay locks it. The onlyUnlocked modifier trips before the chainId/sequence/signature checks.
+    /// @dev A lock op sets unlocksAt = type(uint40).max, so the account stays locked regardless of warp; any non-zero
+    ///      unlock delay locks it. The onlyUnlocked modifier trips before the chainId/sequence/signature checks, so
+    ///      the account is a controllable EOA (its inline default-EOA self signs the lock) and the actors/sig are
+    ///      never reached.
     function test_importAccount_revert_accountIsLocked(uint256 ownerSeed, uint16 delay, bool multichain) public {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         vm.assume(delay != 0);
+        address account = vm.addr(ownerPk);
 
-        AccountConfiguration.InitialActor[] memory actors = _singleUnrestrictedActor(vm.addr(ownerPk));
+        AccountConfiguration.InitialActor[] memory actors = _singleUnrestrictedActor(account);
         uint256 chainId = _acceptedChainId(multichain);
-        (MockERC1271Wallet wallet, bytes memory sig) = _walletAndSig(ownerPk, chainId, actors);
 
-        vm.prank(address(wallet));
-        accountConfiguration.lock(delay);
+        _signedLock(ownerPk, account, delay);
 
         vm.expectRevert(AccountConfiguration.AccountIsLocked.selector);
-        accountConfiguration.importAccount(address(wallet), chainId, actors, sig);
+        accountConfiguration.importAccount(account, chainId, actors, "");
     }
 
     /// @notice Verifies importAccount reverts for a chainId that is neither 0 (multichain) nor the current chain.
@@ -219,9 +225,7 @@ contract ImportAccountTest is AccountConfigurationTest {
             actorId: bytes32(bytes20(device)),
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: address(k1Authenticator), scope: 0x00, expiry: 0, policyType: 0x00
-                }),
+                AccountConfiguration.ActorConfig({authenticator: address(k1Authenticator), scope: 0x00, expiry: 0}),
                 bytes("")
             )
         });
@@ -337,8 +341,12 @@ contract ImportAccountTest is AccountConfigurationTest {
         bytes32 larger = idA < idB ? idB : idA;
 
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](2);
-        actors[0] = AccountConfiguration.InitialActor({actorId: larger, authenticator: address(k1Authenticator)});
-        actors[1] = AccountConfiguration.InitialActor({actorId: smaller, authenticator: address(k1Authenticator)});
+        actors[0] = AccountConfiguration.InitialActor({
+            actorId: larger, authenticator: address(k1Authenticator), scope: 0, policyData: ""
+        });
+        actors[1] = AccountConfiguration.InitialActor({
+            actorId: smaller, authenticator: address(k1Authenticator), scope: 0, policyData: ""
+        });
 
         uint256 chainId = _acceptedChainId(multichain);
         (MockERC1271Wallet wallet, bytes memory sig) = _walletAndSig(ownerPk, chainId, actors);
@@ -355,8 +363,12 @@ contract ImportAccountTest is AccountConfigurationTest {
         vm.assume(id != 0);
 
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](2);
-        actors[0] = AccountConfiguration.InitialActor({actorId: id, authenticator: address(k1Authenticator)});
-        actors[1] = AccountConfiguration.InitialActor({actorId: id, authenticator: address(k1Authenticator)});
+        actors[0] = AccountConfiguration.InitialActor({
+            actorId: id, authenticator: address(k1Authenticator), scope: 0, policyData: ""
+        });
+        actors[1] = AccountConfiguration.InitialActor({
+            actorId: id, authenticator: address(k1Authenticator), scope: 0, policyData: ""
+        });
 
         uint256 chainId = _acceptedChainId(multichain);
         (MockERC1271Wallet wallet, bytes memory sig) = _walletAndSig(ownerPk, chainId, actors);
@@ -375,7 +387,8 @@ contract ImportAccountTest is AccountConfigurationTest {
         vm.assume(actorId != 0);
 
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](1);
-        actors[0] = AccountConfiguration.InitialActor({actorId: actorId, authenticator: address(0)});
+        actors[0] =
+            AccountConfiguration.InitialActor({actorId: actorId, authenticator: address(0), scope: 0, policyData: ""});
 
         uint256 chainId = _acceptedChainId(multichain);
         (MockERC1271Wallet wallet, bytes memory sig) = _walletAndSig(ownerPk, chainId, actors);
@@ -471,7 +484,6 @@ contract ImportAccountTest is AccountConfigurationTest {
             assertEq(config.authenticator, address(k1Authenticator));
             assertEq(config.scope, 0);
             assertEq(config.expiry, 0);
-            assertEq(config.policyType, 0);
         }
     }
 
@@ -537,7 +549,10 @@ contract ImportAccountTest is AccountConfigurationTest {
 
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](1);
         actors[0] = AccountConfiguration.InitialActor({
-            actorId: bytes32(bytes20(eoa)), authenticator: accountConfiguration.K1_AUTHENTICATOR()
+            actorId: bytes32(bytes20(eoa)),
+            authenticator: accountConfiguration.K1_AUTHENTICATOR(),
+            scope: 0,
+            policyData: ""
         });
 
         bytes32 digest = _computeImportDigest(eoa, actors);
@@ -550,7 +565,7 @@ contract ImportAccountTest is AccountConfigurationTest {
         // The same key still authenticates as a full owner — now via its explicit self config, not the (disabled)
         // implicit fallback.
         bytes32 h = keccak256("post import");
-        (uint8 scope,,) = accountConfiguration.authenticateActor(eoa, h, _buildK1Auth(eoaPk, h));
+        (uint8 scope,) = accountConfiguration.authenticateActor(eoa, h, _buildK1Auth(eoaPk, h));
         assertEq(scope, 0);
     }
 }

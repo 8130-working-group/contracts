@@ -19,10 +19,11 @@ import {AccountConfigurationTest} from "../../lib/AccountConfigurationTest.sol";
 ///         The authentication functions are `view` and emit no events, so there are no event assertions here;
 ///         events (ActorAuthorized / ActorRevoked) belong to the applyKeyChange suite that drives the config writes.
 contract AuthenticateTest is AccountConfigurationTest {
-    uint8 constant SCOPE_SIGNER = 0x01;
-    uint8 constant SCOPE_SENDER = 0x02;
-    uint8 constant SCOPE_PAYER = 0x04;
-    uint8 constant SCOPE_CONFIG = 0x08;
+    uint8 constant SCOPE_SENDER = 0x01;
+    uint8 constant SCOPE_POLICY = 0x02;
+    uint8 constant SCOPE_NONCE = 0x04;
+    uint8 constant SCOPE_SELF_PAYER = 0x08;
+    uint8 constant SCOPE_SPONSOR_PAYER = 0x10;
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     // REVERTS (source order)
@@ -348,16 +349,15 @@ contract AuthenticateTest is AccountConfigurationTest {
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
     /// @notice A never-created EOA authenticates via the implicit self key as a full owner (all-zero inline config).
-    /// @dev _authenticateK1 inline-self branch: recovered == account, flag unset, expiry 0 -> (0, 0, address(0)).
+    /// @dev _authenticateK1 inline-self branch: recovered == account, flag unset, expiry 0 -> (0, address(0)).
     function test_authenticateActor_success_implicitEoaSelf(uint256 eoaSeed, bytes32 hash) public view {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
 
-        (uint8 scope, uint8 policyType, address policyTarget) =
+        (uint8 scope, address policyTarget) =
             accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
 
         assertEq(scope, uint8(0x00));
-        assertEq(policyType, uint8(0x00));
         assertEq(policyTarget, address(0));
     }
 
@@ -374,24 +374,25 @@ contract AuthenticateTest is AccountConfigurationTest {
         vm.assume(vm.addr(actorPk) != account);
         _authorizeActorWithScope(account, ownerPk, bytes32(bytes20(vm.addr(actorPk))), address(k1Authenticator), 0x00);
 
-        (uint8 scope,,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
+        (uint8 scope,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
         assertEq(scope, uint8(0x00));
     }
 
     /// @notice A registered P-256 actor authenticates via the non-K1 authenticator path.
-    /// @dev _authenticate (non-K1) success: IAuthenticator resolves actorId, config.authenticator == p256.
+    /// @dev _authenticate (non-K1) success: IAuthenticator resolves actorId, config.authenticator == p256. The
+    ///      SCOPE_POLICY bit is cleared so no policyData is required at authorize time.
     function test_authenticateActor_success_p256Actor(uint256 ownerSeed, uint256 pkSeed, uint8 scopeSeed, bytes32 hash)
         public
     {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         uint256 pk = _boundP256Pk(pkSeed);
-        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255));
+        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255)) & ~SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         _authorizeActorWithScope(account, ownerPk, _p256ActorId(pk), address(p256Authenticator), scope);
 
         bytes memory auth = abi.encodePacked(address(p256Authenticator), _p256SignData(pk, hash));
-        (uint8 outScope,,) = accountConfiguration.authenticateActor(account, hash, auth);
+        (uint8 outScope,) = accountConfiguration.authenticateActor(account, hash, auth);
         assertEq(outScope, scope);
     }
 
@@ -405,18 +406,19 @@ contract AuthenticateTest is AccountConfigurationTest {
     ) public {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         uint256 pk = _boundP256Pk(pkSeed);
-        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255));
+        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255)) & ~SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         _authorizeActorWithScope(account, ownerPk, _p256ActorId(pk), address(webAuthnAuthenticator), scope);
 
         bytes memory auth = abi.encodePacked(address(webAuthnAuthenticator), _webauthnSignData(pk, hash));
-        (uint8 outScope,,) = accountConfiguration.authenticateActor(account, hash, auth);
+        (uint8 outScope,) = accountConfiguration.authenticateActor(account, hash, auth);
         assertEq(outScope, scope);
     }
 
     /// @notice A scoped K1 actor authenticates and surfaces exactly its stored scope.
-    /// @dev Fuzzes the full non-zero scope space to prove passthrough of the scope byte (no SIGNER special-casing).
+    /// @dev Fuzzes the scope space (minus SCOPE_POLICY, which requires policyData) to prove passthrough of the
+    ///      scope byte (no SIGNER special-casing).
     function test_authenticateActor_success_scopedActorReturnsScope(
         uint256 ownerSeed,
         uint256 actorSeed,
@@ -426,13 +428,13 @@ contract AuthenticateTest is AccountConfigurationTest {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         uint256 actorPk = _boundK1Pk(actorSeed);
         vm.assume(vm.addr(ownerPk) != vm.addr(actorPk));
-        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 255));
+        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 255)) & ~SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         vm.assume(vm.addr(actorPk) != account);
         _authorizeActorWithScope(account, ownerPk, bytes32(bytes20(vm.addr(actorPk))), address(k1Authenticator), scope);
 
-        (uint8 outScope,,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
+        (uint8 outScope,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
         assertEq(outScope, scope);
     }
 
@@ -449,7 +451,7 @@ contract AuthenticateTest is AccountConfigurationTest {
         vm.assume(vm.addr(actorPk) != account);
         _authorizeActorWithScope(account, ownerPk, bytes32(bytes20(vm.addr(actorPk))), address(k1Authenticator), 0x00);
 
-        (uint8 scope,,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
+        (uint8 scope,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(actorPk, hash));
         assertEq(scope, uint8(0x00));
     }
 
@@ -470,7 +472,7 @@ contract AuthenticateTest is AccountConfigurationTest {
         _authorizeActorWithExpiry(account, ownerPk, bytes32(bytes20(vm.addr(sessionPk))), address(k1Authenticator), 0);
 
         vm.warp(block.timestamp + bound(warpSeed, 1, 3650 days));
-        (uint8 scope,,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
+        (uint8 scope,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
         assertEq(scope, uint8(0x00));
     }
 
@@ -494,17 +496,16 @@ contract AuthenticateTest is AccountConfigurationTest {
         );
 
         vm.warp(expiry);
-        (uint8 scope,,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
+        (uint8 scope,) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
         assertEq(scope, uint8(0x00));
     }
 
-    /// @notice A policy-gated actor surfaces its scope, policy sub-type byte, and resolved policy target (manager).
-    /// @dev _resolvePolicyTarget returns the stored manager; the commitment is not returned here (execution-time read).
+    /// @notice A policy-gated actor surfaces its scope and resolved policy target (manager).
+    /// @dev policyTarget resolves to the stored manager; the commitment is not returned here (execution-time read).
     function test_authenticateActor_success_gatedActorReturnsScopePolicyTarget(
         uint256 ownerSeed,
         uint256 sessionSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         address manager,
         bytes32 commitment,
         bytes32 hash
@@ -514,34 +515,31 @@ contract AuthenticateTest is AccountConfigurationTest {
         vm.assume(vm.addr(ownerPk) != vm.addr(sessionPk));
         vm.assume(manager != address(0));
         vm.assume(commitment != bytes32(0));
-        // A policy-bearing actor must be scope-restricted (non-zero) without CONFIG scope.
-        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 7));
-        uint8 policyType = uint8(bound(uint256(policyTypeSeed), 1, 255));
+        // A policy-bearing actor's scope carries SCOPE_POLICY; other bits are arbitrary.
+        uint8 scope = uint8(scopeSeed) | SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         vm.assume(vm.addr(sessionPk) != account);
         bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
-        _authorizeGatedActor(account, ownerPk, sessionActorId, scope, policyType, manager, commitment);
+        _authorizeGatedActor(account, ownerPk, sessionActorId, scope, manager, commitment);
 
-        (uint8 outScope, uint8 outPolicyType, address outTarget) =
+        (uint8 outScope, address outTarget) =
             accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
 
         assertEq(outScope, scope);
-        assertEq(outPolicyType, policyType);
         assertEq(outTarget, manager);
     }
 
-    /// @notice An ungated actor authenticates with a zero policy sub-type and a zero policy target.
-    /// @dev policyType == POLICY_NONE short-circuits _resolvePolicyTarget to address(0).
+    /// @notice An ungated actor authenticates with a zero policy target.
+    /// @dev No manager slot is written for an ungated actor, so policyTarget is address(0).
     function test_authenticateActor_success_ungatedActorReturnsZeroPolicy(uint256 eoaSeed, bytes32 hash) public view {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
 
-        (uint8 scope, uint8 policyType, address policyTarget) =
+        (uint8 scope, address policyTarget) =
             accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
 
         assertEq(scope, uint8(0x00));
-        assertEq(policyType, uint8(0x00));
         assertEq(policyTarget, address(0));
     }
 
@@ -551,11 +549,12 @@ contract AuthenticateTest is AccountConfigurationTest {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
         bytes32 selfActorId = bytes32(bytes20(eoa));
-        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 255));
+        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 255)) & ~SCOPE_POLICY;
+        vm.assume(scope != 0);
 
         _authorizeActorWithScope(eoa, eoaPk, selfActorId, address(k1Authenticator), scope);
 
-        (uint8 outScope,,) = accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
+        (uint8 outScope,) = accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
         assertEq(outScope, scope);
     }
 
@@ -571,7 +570,7 @@ contract AuthenticateTest is AccountConfigurationTest {
 
         _implicitAuthorizeActor(eoa, eoaPk, bytes32(bytes20(vm.addr(bobPk))), address(k1Authenticator));
 
-        (uint8 scope,,) = accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(bobPk, hash));
+        (uint8 scope,) = accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(bobPk, hash));
         assertEq(scope, uint8(0x00));
     }
 
@@ -588,20 +587,22 @@ contract AuthenticateTest is AccountConfigurationTest {
         vm.assume(accountA != accountB);
 
         bytes memory auth = _buildK1Auth(ownerPk, hash);
-        (uint8 scopeA,,) = accountConfiguration.authenticateActor(accountA, hash, auth);
-        (uint8 scopeB,,) = accountConfiguration.authenticateActor(accountB, hash, auth);
+        (uint8 scopeA,) = accountConfiguration.authenticateActor(accountA, hash, auth);
+        (uint8 scopeB,) = accountConfiguration.authenticateActor(accountB, hash, auth);
         assertEq(scopeA, uint8(0x00));
         assertEq(scopeB, uint8(0x00));
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-    // verifySignature (SIGNER gate)
+    // verifySignature (operational authority)
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice verifySignature returns true iff the resolved actor's scope is unrestricted or carries SCOPE_SIGNER.
-    /// @dev Fuzzes the full scope space [0,255] and asserts the boolean equals `scope == 0 || scope & SIGNER != 0`,
-    ///      proving the SIGNER gate across every scope combination.
-    function test_verifySignature_success_signerGateAcrossScopes(
+    /// @notice verifySignature returns true for any operational actor: the admin (scope == 0x00) or a SENDER actor
+    ///         without POLICY. Payer-only / nonce-only (non-SENDER) scopes are not operational and verify false.
+    /// @dev Fuzzes the (POLICY-cleared) scope space and asserts the boolean equals the operational predicate
+    ///      `scope == 0 || (scope & SCOPE_SENDER != 0)`, proving ERC-1271 signing is operational — not admin-only,
+    ///      and with no dedicated SIGNER grant.
+    function test_verifySignature_success_operationalAcrossScopes(
         uint256 ownerSeed,
         uint256 actorSeed,
         uint8 scopeSeed,
@@ -610,14 +611,89 @@ contract AuthenticateTest is AccountConfigurationTest {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         uint256 actorPk = _boundK1Pk(actorSeed);
         vm.assume(vm.addr(ownerPk) != vm.addr(actorPk));
-        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255));
+        uint8 scope = uint8(bound(uint256(scopeSeed), 0, 255)) & ~SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         vm.assume(vm.addr(actorPk) != account);
         _authorizeActorWithScope(account, ownerPk, bytes32(bytes20(vm.addr(actorPk))), address(k1Authenticator), scope);
 
-        bool expected = scope == 0 || scope & SCOPE_SIGNER != 0;
+        bool expected = scope == 0 || (scope & SCOPE_SENDER != 0);
         assertEq(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)), expected);
+    }
+
+    /// @notice A SENDER actor without POLICY is operational and verifies true via verifySignature.
+    /// @dev Positive guard for the operational-authority path: signing is authority a SENDER key already holds via
+    ///      calls, so it does not require the admin scope. Covers SENDER alone and SENDER combined with the
+    ///      SELF_PAYER / NONCE capability bits (still no POLICY).
+    function test_verifySignature_success_trueForSenderWithoutPolicy(uint256 ownerSeed, uint256 actorSeed, bytes32 hash)
+        public
+    {
+        uint256 ownerPk = _boundK1Pk(ownerSeed);
+        uint256 actorPk = _boundK1Pk(actorSeed);
+        vm.assume(vm.addr(ownerPk) != vm.addr(actorPk));
+
+        (address account,) = _createK1Account(ownerPk);
+        vm.assume(vm.addr(actorPk) != account);
+        bytes32 actorId = bytes32(bytes20(vm.addr(actorPk)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_SENDER);
+        assertTrue(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_SENDER | SCOPE_SELF_PAYER);
+        assertTrue(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_SENDER | SCOPE_NONCE);
+        assertTrue(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+    }
+
+    /// @notice A non-SENDER capability-only actor (SELF_PAYER-only, SPONSOR_PAYER-only, NONCE-only) is NOT
+    ///         operational and verifies false.
+    /// @dev Negative guard: only admin or SENDER-without-POLICY are operational.
+    function test_verifySignature_success_falseForNonSenderScopes(uint256 ownerSeed, uint256 actorSeed, bytes32 hash)
+        public
+    {
+        uint256 ownerPk = _boundK1Pk(ownerSeed);
+        uint256 actorPk = _boundK1Pk(actorSeed);
+        vm.assume(vm.addr(ownerPk) != vm.addr(actorPk));
+
+        (address account,) = _createK1Account(ownerPk);
+        vm.assume(vm.addr(actorPk) != account);
+        bytes32 actorId = bytes32(bytes20(vm.addr(actorPk)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_SELF_PAYER);
+        assertFalse(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_SPONSOR_PAYER);
+        assertFalse(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+
+        _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), SCOPE_NONCE);
+        assertFalse(accountConfiguration.verifySignature(account, hash, _buildK1Auth(actorPk, hash)));
+    }
+
+    /// @notice A policy-bearing actor is NEVER a valid ERC-1271 signer (a POLICY actor is not operational).
+    /// @dev verifySignature must return false for a scoped SCOPE_POLICY actor.
+    function test_verifySignature_success_falseForPolicyActor(
+        uint256 ownerSeed,
+        uint256 sessionSeed,
+        address manager,
+        bytes32 commitment,
+        bytes32 hash
+    ) public {
+        uint256 ownerPk = _boundK1Pk(ownerSeed);
+        uint256 sessionPk = _boundK1Pk(sessionSeed);
+        vm.assume(vm.addr(ownerPk) != vm.addr(sessionPk));
+        vm.assume(manager != address(0));
+        vm.assume(commitment != bytes32(0));
+
+        (address account,) = _createK1Account(ownerPk);
+        vm.assume(vm.addr(sessionPk) != account);
+        bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
+        _authorizeGatedActor(account, ownerPk, sessionActorId, SCOPE_POLICY, manager, commitment);
+        assertFalse(accountConfiguration.verifySignature(account, hash, _buildK1Auth(sessionPk, hash)));
+
+        // SENDER | POLICY is still not operational: the POLICY bit disqualifies it even though SENDER is set.
+        _authorizeGatedActor(account, ownerPk, sessionActorId, SCOPE_SENDER | SCOPE_POLICY, manager, commitment);
+        assertFalse(accountConfiguration.verifySignature(account, hash, _buildK1Auth(sessionPk, hash)));
     }
 
     /// @notice verifySignature returns false when authentication fails outright (unregistered signer).
@@ -639,13 +715,12 @@ contract AuthenticateTest is AccountConfigurationTest {
     // getPolicy / getActorConfig / isActor (actor-resolution views)
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice getPolicy resolves a gated actor's sub-type, manager, and signed commitment.
-    /// @dev Non-zero policyType returns (policyType, manager, commitment) from the policy keyspace.
+    /// @notice getPolicy resolves a gated actor's manager and signed commitment.
+    /// @dev Returns (manager, commitment) from the policy keyspace when scope & SCOPE_POLICY is set.
     function test_getPolicy_success_gatedActor(
         uint256 ownerSeed,
         uint256 sessionSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         address manager,
         bytes32 commitment
     ) public {
@@ -654,22 +729,19 @@ contract AuthenticateTest is AccountConfigurationTest {
         vm.assume(vm.addr(ownerPk) != vm.addr(sessionPk));
         vm.assume(manager != address(0));
         vm.assume(commitment != bytes32(0));
-        uint8 scope = uint8(bound(uint256(scopeSeed), 1, 7));
-        uint8 policyType = uint8(bound(uint256(policyTypeSeed), 1, 255));
+        uint8 scope = uint8(scopeSeed) | SCOPE_POLICY;
 
         (address account,) = _createK1Account(ownerPk);
         bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
-        _authorizeGatedActor(account, ownerPk, sessionActorId, scope, policyType, manager, commitment);
+        _authorizeGatedActor(account, ownerPk, sessionActorId, scope, manager, commitment);
 
-        (uint8 outPolicyType, address outTarget, bytes32 outCommitment) =
-            accountConfiguration.getPolicy(account, sessionActorId);
-        assertEq(outPolicyType, policyType);
+        (address outTarget, bytes32 outCommitment) = accountConfiguration.getPolicy(account, sessionActorId);
         assertEq(outTarget, manager);
         assertEq(outCommitment, commitment);
     }
 
     /// @notice getPolicy returns the zero policy for an ungated actor.
-    /// @dev policyType == POLICY_NONE returns (0, address(0), bytes32(0)).
+    /// @dev No policy slots written for scope & SCOPE_POLICY == 0 -> (address(0), bytes32(0)).
     function test_getPolicy_success_ungatedActor(uint256 ownerSeed, uint256 actorSeed) public {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
         uint256 actorPk = _boundK1Pk(actorSeed);
@@ -680,8 +752,7 @@ contract AuthenticateTest is AccountConfigurationTest {
         bytes32 actorId = bytes32(bytes20(vm.addr(actorPk)));
         _authorizeActorWithScope(account, ownerPk, actorId, address(k1Authenticator), 0x00);
 
-        (uint8 policyType, address target, bytes32 commitment) = accountConfiguration.getPolicy(account, actorId);
-        assertEq(policyType, uint8(0x00));
+        (address target, bytes32 commitment) = accountConfiguration.getPolicy(account, actorId);
         assertEq(target, address(0));
         assertEq(commitment, bytes32(0));
     }
@@ -743,7 +814,8 @@ contract AuthenticateTest is AccountConfigurationTest {
 
     /// @dev Authorize `newActorId` under `authenticator` with `scope` (no expiry, no policy), signed by `pk`.
     ///      For the self-actorId with the K1 authenticator this drives the inline-self home; for any other
-    ///      authenticator on the self-actorId it drives the mutually-exclusive non-K1 self home.
+    ///      authenticator on the self-actorId it drives the mutually-exclusive non-K1 self home. `scope` must not
+    ///      carry SCOPE_POLICY (no policyData is provided).
     function _authorizeActorWithScope(
         address account,
         uint256 pk,
@@ -756,10 +828,7 @@ contract AuthenticateTest is AccountConfigurationTest {
             actorId: newActorId,
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: authenticator, scope: scope, expiry: 0, policyType: 0x00
-                }),
-                bytes("")
+                AccountConfiguration.ActorConfig({authenticator: authenticator, scope: scope, expiry: 0}), bytes("")
             )
         });
 
@@ -781,10 +850,7 @@ contract AuthenticateTest is AccountConfigurationTest {
             actorId: newActorId,
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: authenticator, scope: 0x00, expiry: expiry, policyType: 0x00
-                }),
-                bytes("")
+                AccountConfiguration.ActorConfig({authenticator: authenticator, scope: 0x00, expiry: expiry}), bytes("")
             )
         });
 
@@ -809,12 +875,12 @@ contract AuthenticateTest is AccountConfigurationTest {
     }
 
     /// @dev Authorize a K1 policy-gated actor: manager[20] || commitment[32] policy data, signed by the owner `pk`.
+    ///      `scope` must carry SCOPE_POLICY.
     function _authorizeGatedActor(
         address account,
         uint256 ownerPk,
         bytes32 newActorId,
         uint8 scope,
-        uint8 policyType,
         address policyManager,
         bytes32 commitment
     ) internal {
@@ -823,9 +889,7 @@ contract AuthenticateTest is AccountConfigurationTest {
             actorId: newActorId,
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: address(k1Authenticator), scope: scope, expiry: 0, policyType: policyType
-                }),
+                AccountConfiguration.ActorConfig({authenticator: address(k1Authenticator), scope: scope, expiry: 0}),
                 abi.encodePacked(policyManager, commitment)
             )
         });

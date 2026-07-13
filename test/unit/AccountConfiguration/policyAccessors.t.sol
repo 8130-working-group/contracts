@@ -5,33 +5,17 @@ import {AccountConfiguration} from "../../../src/AccountConfiguration.sol";
 import {AccountConfigurationTest} from "../../lib/AccountConfigurationTest.sol";
 
 /// @notice Fully-fuzzed unit tests for the policy accessors on `AccountConfiguration`:
-///           - `getPolicy(account, actorId)`           — off-chain aggregate: (policyType, manager, commitment)
+///           - `getPolicy(account, actorId)`           — off-chain aggregate: (manager, commitment)
 ///           - `getPolicyCommitment(account, actorId)` — single-SLOAD hot-path read
 ///           - `getPolicyManager(account, actorId)`    — single-SLOAD hot-path read
-///           - `_resolvePolicyTarget(...)`             — internal; exercised via `authenticateActor`'s policyTarget
+///           - policyTarget                            — surfaced as the second return of `authenticateActor`
 ///
-///         All four are `view`; there are no events to assert. Every test fuzzes its inputs (managers, commitments,
-///         actorIds, keys, scopes, and the non-zero policyType byte). A policy-bearing (gated) actor requires a
-///         non-zero manager and non-zero commitment (else `_slicePolicy` reverts `InvalidPolicyData`) and a
-///         scope-restricted, non-CONFIG scope (else `_authorizeActor` reverts `InvalidPolicyScope`) — so gated
-///         fuzzing bounds manager/commitment to non-zero and scope to [1,7] (any non-zero value with the 0x08
-///         CONFIG bit clear).
-///
-///         Branch map covered:
-///           getPolicy line ~528  stored.authenticator != 0            -> explicit-actor home (gated + ungated)
-///           getPolicy line ~531  else-if actorId==self && !revoked    -> inline-k1-self home (true; false via revoke)
-///           getPolicy line ~535  else                                  -> unknown actor / revoked self
-///           getPolicy line ~537  policyType == POLICY_NONE early-return -> both sides (gated vs ungated/none)
-///           _resolvePolicyTarget line ~887 policyType == NONE           -> both sides (returns 0 vs returns manager)
+///         All are `view`; there are no events to assert. Every test fuzzes its inputs (managers, commitments,
+///         actorIds, keys, scopes). Gating is determined by the SCOPE_POLICY bit, never by "slot non-zero": a
+///         policy-bearing actor's policyData is exactly 52 bytes (manager(20) || commitment(32)) and is written
+///         verbatim, even when a field is zero. Tests bound manager/commitment to non-zero only so the written
+///         value is distinguishable from the ungated (unwritten, zero) case.
 contract PolicyAccessorsTest is AccountConfigurationTest {
-    uint8 internal constant SCOPE_SIGNER = 0x01;
-    uint8 internal constant SCOPE_SENDER = 0x02;
-    uint8 internal constant SCOPE_PAYER = 0x04;
-    uint8 internal constant SCOPE_CONFIG = 0x08;
-
-    uint8 internal constant POLICY_NONE = 0x00;
-    uint8 internal constant POLICY_GATED = 0x01;
-
     uint8 internal constant AUTHORIZE_ACTOR = 0x01;
     uint8 internal constant REVOKE_ACTOR = 0x02;
 
@@ -39,13 +23,12 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     // getPolicy — explicit (non-self) actor home  (stored.authenticator != 0)
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice A gated non-self actor: getPolicy returns (policyType, manager, commitment) and the aggregate agrees
-    ///         with the granular accessors. Covers the explicit-actor home and the `policyType != NONE` tail.
+    /// @notice A gated non-self actor: getPolicy returns (manager, commitment) and the aggregate agrees with the
+    ///         granular accessors. Covers the explicit-actor home.
     function test_getPolicy_success_explicitGatedActor(
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -54,14 +37,12 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         actorId = _boundExplicitActorId(account, rootPk, actorId);
 
         uint8 scope = _boundGatedScope(scopeSeed);
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
 
-        _authorizePolicyActor(account, rootPk, actorId, scope, policyType, manager, commitment);
+        _authorizePolicyActor(account, rootPk, actorId, scope, manager, commitment);
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
-        assertEq(outType, policyType);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
         assertEq(outManager, manager);
         assertEq(outCommitment, commitment);
         // Aggregate agrees with the single-SLOAD granular accessors.
@@ -69,8 +50,8 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         assertEq(outCommitment, accountConfiguration.getPolicyCommitment(account, actorId));
     }
 
-    /// @notice A non-self actor authorized with policyType == NONE: getPolicy short-circuits to (0, 0, 0). Covers
-    ///         the explicit-actor home reaching the `policyType == POLICY_NONE` early-return (line ~537, true side).
+    /// @notice A non-self actor authorized ungated (scope & SCOPE_POLICY == 0): getPolicy returns (0, 0). Covers
+    ///         the explicit-actor home with no policy slots written.
     function test_getPolicy_success_ungatedExplicitActor_returnsNone(uint256 rootSeed, bytes32 actorId) public {
         uint256 rootPk = _boundK1Pk(rootSeed);
         (address account,) = _createK1Account(rootPk);
@@ -78,8 +59,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         _authorizeUngatedActor(account, rootPk, actorId, address(k1Authenticator));
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
-        assertEq(outType, POLICY_NONE);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
         assertEq(outManager, address(0));
         assertEq(outCommitment, bytes32(0));
     }
@@ -88,16 +68,14 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     // getPolicy — inline-k1-self home  (else-if actorId == self && !revoked)
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     //
-    // The inline-k1 self stores scope/policyType/expiry in AccountState, but manager/commitment live in the shared
-    // actorId-keyed keyspace — so the accessors must resolve identically to the explicit-actor home. This is the
-    // branch getPolicy reaches through its `else if`.
+    // The inline-k1 self stores scope/expiry in AccountState, but manager/commitment live in the shared
+    // actorId-keyed keyspace — so the accessors must resolve identically to the explicit-actor home.
 
-    /// @notice A gated inline-k1 self: getPolicy returns (policyType, manager, commitment) and agrees with the
-    ///         granular accessors. Covers the inline-self home (else-if true) and the `policyType != NONE` tail.
+    /// @notice A gated inline-k1 self: getPolicy returns (manager, commitment) and agrees with the granular
+    ///         accessors. Covers the inline-self home.
     function test_getPolicy_success_inlineSelfGatedActor(
         uint256 eoaSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -106,29 +84,25 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         bytes32 selfActorId = bytes32(bytes20(eoa));
 
         uint8 scope = _boundGatedScope(scopeSeed);
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
 
-        _authorizeInlineSelfWithPolicy(eoa, eoaPk, scope, policyType, manager, commitment);
+        _authorizeInlineSelfWithPolicy(eoa, eoaPk, scope, manager, commitment);
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
-        assertEq(outType, policyType);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
         assertEq(outManager, manager);
         assertEq(outCommitment, commitment);
         assertEq(outManager, accountConfiguration.getPolicyManager(eoa, selfActorId));
         assertEq(outCommitment, accountConfiguration.getPolicyCommitment(eoa, selfActorId));
     }
 
-    /// @notice A fresh EOA's implicit self (full owner, policyType == NONE): getPolicy short-circuits to (0, 0, 0).
-    ///         Covers the inline-self home (else-if true, no _actorConfig, not revoked) reaching the
-    ///         `policyType == POLICY_NONE` early-return (line ~537, true side) from the inline home.
+    /// @notice A fresh EOA's implicit self (full owner, ungated): getPolicy returns (0, 0). Covers the inline-self
+    ///         home (else-if true, no _actorConfig, not revoked) with no policy slots written.
     function test_getPolicy_success_inlineSelfUngated_returnsNone(uint256 eoaSeed) public view {
         address eoa = vm.addr(_boundK1Pk(eoaSeed));
         bytes32 selfActorId = bytes32(bytes20(eoa));
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
-        assertEq(outType, POLICY_NONE);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
         assertEq(outManager, address(0));
         assertEq(outCommitment, bytes32(0));
     }
@@ -137,38 +111,33 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     // getPolicy — else branch  (unknown actor / revoked self)
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice An unknown (never-authorized, non-self) actor: getPolicy takes the else branch and returns (0, 0, 0).
-    ///         No account is created, so this is a pure view over empty state.
+    /// @notice An unknown (never-authorized, non-self) actor: getPolicy returns (0, 0) over empty state.
     function test_getPolicy_success_unknownActor_returnsNone(address account, bytes32 actorId) public view {
         vm.assume(actorId != bytes32(bytes20(account))); // stay off the inline-self else-if
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
-        assertEq(outType, POLICY_NONE);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(account, actorId);
         assertEq(outManager, address(0));
         assertEq(outCommitment, bytes32(0));
     }
 
-    /// @notice A gated inline self that is then revoked: getPolicy takes the else branch (self actorId, but
-    ///         `!_isDefaultEoaRevoked` is false) and returns (0, 0, 0). Covers the false side of the else-if's
-    ///         `!revoked` sub-condition.
+    /// @notice A gated inline self that is then revoked: getPolicy returns (0, 0). The revoke clears the shared
+    ///         (actorId-keyed) policy slots.
     function test_getPolicy_success_revokedInlineSelf_returnsNone(
         uint256 eoaSeed,
         uint256 ownerSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
         (address eoa, uint256 ownerPk) = _seedGatedInlineSelfWithSpareOwner(
-            eoaSeed, ownerSeed, scopeSeed, policyTypeSeed, managerSeed, commitmentSeed
+            eoaSeed, ownerSeed, scopeSeed, managerSeed, commitmentSeed
         );
         bytes32 selfActorId = bytes32(bytes20(eoa));
 
         // Revoke the (downgraded) self via the spare unrestricted owner; the policy-scoped self cannot sign config.
         _revokeActor(eoa, ownerPk, selfActorId);
 
-        (uint8 outType, address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
-        assertEq(outType, POLICY_NONE);
+        (address outManager, bytes32 outCommitment) = accountConfiguration.getPolicy(eoa, selfActorId);
         assertEq(outManager, address(0));
         assertEq(outCommitment, bytes32(0));
     }
@@ -181,7 +150,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -191,13 +159,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizePolicyActor(
-            account,
-            rootPk,
-            actorId,
-            _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
-            manager,
-            _boundNonZeroWord(commitmentSeed)
+            account, rootPk, actorId, _boundGatedScope(scopeSeed), manager, _boundNonZeroWord(commitmentSeed)
         );
 
         assertEq(accountConfiguration.getPolicyManager(account, actorId), manager);
@@ -207,7 +169,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -217,13 +178,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
         _authorizePolicyActor(
-            account,
-            rootPk,
-            actorId,
-            _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
-            _boundNonZeroAddress(managerSeed),
-            commitment
+            account, rootPk, actorId, _boundGatedScope(scopeSeed), _boundNonZeroAddress(managerSeed), commitment
         );
 
         assertEq(accountConfiguration.getPolicyCommitment(account, actorId), commitment);
@@ -232,7 +187,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     function test_getPolicyManager_success_inlineSelfGatedActor(
         uint256 eoaSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -242,12 +196,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizeInlineSelfWithPolicy(
-            eoa,
-            eoaPk,
-            _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
-            manager,
-            _boundNonZeroWord(commitmentSeed)
+            eoa, eoaPk, _boundGatedScope(scopeSeed), manager, _boundNonZeroWord(commitmentSeed)
         );
 
         assertEq(accountConfiguration.getPolicyManager(eoa, selfActorId), manager);
@@ -256,7 +205,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     function test_getPolicyCommitment_success_inlineSelfGatedActor(
         uint256 eoaSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -266,19 +214,14 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
         _authorizeInlineSelfWithPolicy(
-            eoa,
-            eoaPk,
-            _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
-            _boundNonZeroAddress(managerSeed),
-            commitment
+            eoa, eoaPk, _boundGatedScope(scopeSeed), _boundNonZeroAddress(managerSeed), commitment
         );
 
         assertEq(accountConfiguration.getPolicyCommitment(eoa, selfActorId), commitment);
     }
 
-    /// @notice An ungated actor never has manager/commitment written (per `_authorizeActor`'s conditional writes),
-    ///         so both granular accessors return zero.
+    /// @notice An ungated actor never has manager/commitment written (per `_authorizeActor`'s SCOPE_POLICY-gated
+    ///         writes), so both granular accessors return zero.
     function test_getPolicyManager_success_ungatedActor_returnsZero(uint256 rootSeed, bytes32 actorId) public {
         uint256 rootPk = _boundK1Pk(rootSeed);
         (address account,) = _createK1Account(rootPk);
@@ -309,7 +252,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-    // Lifecycle — invariant: granular slots non-zero iff policyType non-zero
+    // Lifecycle — invariant: policy slots written iff scope & SCOPE_POLICY
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
     /// @notice Revoking an explicit gated actor clears both policy slots (`_revokeActor` deletes them).
@@ -317,7 +260,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -327,9 +269,7 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         address manager = _boundNonZeroAddress(managerSeed);
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
-        _authorizePolicyActor(
-            account, rootPk, actorId, _boundGatedScope(scopeSeed), _boundPolicyType(policyTypeSeed), manager, commitment
-        );
+        _authorizePolicyActor(account, rootPk, actorId, _boundGatedScope(scopeSeed), manager, commitment);
 
         // Live first.
         assertEq(accountConfiguration.getPolicyManager(account, actorId), manager);
@@ -346,13 +286,11 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         uint256 eoaSeed,
         uint256 ownerSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
-        (address eoa, uint256 ownerPk) = _seedGatedInlineSelfWithSpareOwner(
-            eoaSeed, ownerSeed, scopeSeed, policyTypeSeed, managerSeed, commitmentSeed
-        );
+        (address eoa, uint256 ownerPk) =
+            _seedGatedInlineSelfWithSpareOwner(eoaSeed, ownerSeed, scopeSeed, managerSeed, commitmentSeed);
         bytes32 selfActorId = bytes32(bytes20(eoa));
 
         // Live first.
@@ -365,13 +303,12 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         assertEq(accountConfiguration.getPolicyCommitment(eoa, selfActorId), bytes32(0));
     }
 
-    /// @notice Re-authorizing a gated actor down to POLICY_NONE clears both policy slots (no stale leak) and the
-    ///         config's policyType/scope fall to zero.
+    /// @notice Re-authorizing a gated actor down to an ungated scope clears both policy slots (no stale leak) and
+    ///         the config's scope falls to zero.
     function test_getPolicyAccessors_success_clearedOnReauthorizeToNone(
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) public {
@@ -384,18 +321,16 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
             rootPk,
             actorId,
             _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
             _boundNonZeroAddress(managerSeed),
             _boundNonZeroWord(commitmentSeed)
         );
 
-        // Overwrite the same actor as ungated (policyType == POLICY_NONE).
+        // Overwrite the same actor as ungated (scope & SCOPE_POLICY == 0).
         _authorizeUngatedActor(account, rootPk, actorId, address(k1Authenticator));
 
         assertEq(accountConfiguration.getPolicyManager(account, actorId), address(0));
         assertEq(accountConfiguration.getPolicyCommitment(account, actorId), bytes32(0));
         AccountConfiguration.ActorConfig memory cfg = accountConfiguration.getActorConfig(account, actorId);
-        assertEq(cfg.policyType, POLICY_NONE);
         assertEq(cfg.scope, uint8(0x00));
     }
 
@@ -404,7 +339,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         uint256 rootSeed,
         bytes32 actorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed,
         uint256 newManagerSeed,
@@ -415,7 +349,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         actorId = _boundExplicitActorId(account, rootPk, actorId);
 
         uint8 scope = _boundGatedScope(scopeSeed);
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
         address newManager = _boundNonZeroAddress(newManagerSeed);
@@ -424,11 +357,59 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         vm.assume(newManager != manager);
         vm.assume(newCommitment != commitment);
 
-        _authorizePolicyActor(account, rootPk, actorId, scope, policyType, manager, commitment);
-        _authorizePolicyActor(account, rootPk, actorId, scope, policyType, newManager, newCommitment);
+        _authorizePolicyActor(account, rootPk, actorId, scope, manager, commitment);
+        _authorizePolicyActor(account, rootPk, actorId, scope, newManager, newCommitment);
 
         assertEq(accountConfiguration.getPolicyManager(account, actorId), newManager);
         assertEq(accountConfiguration.getPolicyCommitment(account, actorId), newCommitment);
+    }
+
+    /// @notice A gated actor may legitimately carry a zero manager and/or zero commitment: the relaxed policyData
+    ///         rule writes both slots verbatim. Gating is by the SCOPE_POLICY bit, not slot non-zero.
+    function test_getPolicyAccessors_success_gatedWithZeroManagerAndCommitment(uint256 rootSeed, bytes32 actorId)
+        public
+    {
+        uint256 rootPk = _boundK1Pk(rootSeed);
+        (address account,) = _createK1Account(rootPk);
+        actorId = _boundExplicitActorId(account, rootPk, actorId);
+
+        _authorizePolicyActor(account, rootPk, actorId, accountConfiguration.SCOPE_POLICY(), address(0), bytes32(0));
+
+        // Slots are zero, yet the actor is gated by the SCOPE_POLICY bit.
+        assertEq(accountConfiguration.getPolicyManager(account, actorId), address(0));
+        assertEq(accountConfiguration.getPolicyCommitment(account, actorId), bytes32(0));
+        AccountConfiguration.ActorConfig memory cfg = accountConfiguration.getActorConfig(account, actorId);
+        assertTrue(cfg.scope & accountConfiguration.SCOPE_POLICY() != 0);
+    }
+
+    /// @notice This contract does not reject scope combinations: an actor may carry SCOPE_POLICY alongside any
+    ///         other scope bits — use-time exclusivity is protocol-side, not enforced here.
+    function test_authorizePolicyActor_allowsAnyScopeCombination(
+        uint256 rootSeed,
+        uint256 managerSeed,
+        uint256 commitmentSeed
+    ) public {
+        uint256 rootPk = _boundK1Pk(rootSeed);
+        (address account,) = _createK1Account(rootPk);
+        address manager = _boundNonZeroAddress(managerSeed);
+        bytes32 commitment = _boundNonZeroWord(commitmentSeed);
+
+        uint8[4] memory otherScopes = [
+            uint8(0),
+            accountConfiguration.SCOPE_SELF_PAYER(),
+            accountConfiguration.SCOPE_SPONSOR_PAYER(),
+            accountConfiguration.SCOPE_NONCE()
+        ];
+        for (uint256 i; i < otherScopes.length; i++) {
+            // Policy actors are keyed by actorId only; no signing key is needed, so a distinct address-shaped id
+            // avoids the vm.addr curve-order bound on an unbounded rootPk + i.
+            bytes32 actorId = bytes32(bytes20(address(uint160(1000 + i))));
+            uint8 scope = otherScopes[i] | accountConfiguration.SCOPE_POLICY();
+            _authorizePolicyActor(account, rootPk, actorId, scope, manager, commitment);
+
+            assertEq(accountConfiguration.getPolicyManager(account, actorId), manager);
+            assertEq(accountConfiguration.getPolicyCommitment(account, actorId), commitment);
+        }
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
@@ -441,7 +422,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         bytes32 actorA,
         bytes32 actorB,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeedA,
         uint256 commitmentSeedA,
         uint256 managerSeedB,
@@ -454,14 +434,13 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         vm.assume(actorA != actorB);
 
         uint8 scope = _boundGatedScope(scopeSeed);
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address managerA = _boundNonZeroAddress(managerSeedA);
         bytes32 commitmentA = _boundNonZeroWord(commitmentSeedA);
         address managerB = _boundNonZeroAddress(managerSeedB);
         bytes32 commitmentB = _boundNonZeroWord(commitmentSeedB);
 
-        _authorizePolicyActor(account, rootPk, actorA, scope, policyType, managerA, commitmentA);
-        _authorizePolicyActor(account, rootPk, actorB, scope, policyType, managerB, commitmentB);
+        _authorizePolicyActor(account, rootPk, actorA, scope, managerA, commitmentA);
+        _authorizePolicyActor(account, rootPk, actorB, scope, managerB, commitmentB);
 
         assertEq(accountConfiguration.getPolicyManager(account, actorA), managerA);
         assertEq(accountConfiguration.getPolicyCommitment(account, actorA), commitmentA);
@@ -477,7 +456,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         bytes32 saltB,
         bytes32 sharedActorId,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeedA,
         uint256 commitmentSeedA,
         uint256 managerSeedB,
@@ -494,14 +472,13 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         vm.assume(sharedActorId != bytes32(bytes20(accountB)));
 
         uint8 scope = _boundGatedScope(scopeSeed);
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address managerA = _boundNonZeroAddress(managerSeedA);
         bytes32 commitmentA = _boundNonZeroWord(commitmentSeedA);
         address managerB = _boundNonZeroAddress(managerSeedB);
         bytes32 commitmentB = _boundNonZeroWord(commitmentSeedB);
 
-        _authorizePolicyActor(accountA, rootPk, sharedActorId, scope, policyType, managerA, commitmentA);
-        _authorizePolicyActor(accountB, rootPk, sharedActorId, scope, policyType, managerB, commitmentB);
+        _authorizePolicyActor(accountA, rootPk, sharedActorId, scope, managerA, commitmentA);
+        _authorizePolicyActor(accountB, rootPk, sharedActorId, scope, managerB, commitmentB);
 
         assertEq(accountConfiguration.getPolicyManager(accountA, sharedActorId), managerA);
         assertEq(accountConfiguration.getPolicyCommitment(accountA, sharedActorId), commitmentA);
@@ -510,19 +487,17 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-    // _resolvePolicyTarget — internal, surfaced as `policyTarget` from authenticateActor
+    // policyTarget — surfaced as the second return of authenticateActor
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     //
-    // `_resolvePolicyTarget(account, actorId, policyType)` returns address(0) when policyType == NONE, else the
-    // stored manager. `authenticateActor` returns it verbatim as its third value, so we drive both branches there.
+    // authenticateActor returns the stored policy manager as its second value (address(0) when unwritten).
 
-    /// @notice A gated non-self actor authenticates; policyTarget resolves to the stored manager (policyType != NONE
-    ///         branch). Also equals the granular getPolicyManager read.
-    function test_resolvePolicyTarget_success_gatedExplicitActor_returnsManager(
+    /// @notice A gated non-self actor authenticates; policyTarget resolves to the stored manager, equal to the
+    ///         granular getPolicyManager read.
+    function test_policyTarget_success_gatedExplicitActor_returnsManager(
         uint256 rootSeed,
         uint256 sessionSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed,
         bytes32 hash
@@ -535,33 +510,22 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         vm.assume(vm.addr(sessionPk) != account); // stay off the inline-self path
         bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
 
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizePolicyActor(
-            account,
-            rootPk,
-            sessionActorId,
-            _boundGatedScope(scopeSeed),
-            policyType,
-            manager,
-            _boundNonZeroWord(commitmentSeed)
+            account, rootPk, sessionActorId, _boundGatedScope(scopeSeed), manager, _boundNonZeroWord(commitmentSeed)
         );
 
-        (uint8 outScope, uint8 outPolicyType, address policyTarget) =
+        (uint8 outScope, address policyTarget) =
             accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
-        assertTrue(outScope != 0);
-        assertEq(outPolicyType, policyType);
+        assertTrue(outScope & accountConfiguration.SCOPE_POLICY() != 0);
         assertEq(policyTarget, manager);
         assertEq(policyTarget, accountConfiguration.getPolicyManager(account, sessionActorId));
     }
 
-    /// @notice An ungated non-self actor authenticates; policyType == NONE short-circuits _resolvePolicyTarget to
-    ///         address(0) (the NONE branch).
-    function test_resolvePolicyTarget_success_ungatedActor_returnsZero(
-        uint256 rootSeed,
-        uint256 sessionSeed,
-        bytes32 hash
-    ) public {
+    /// @notice An ungated non-self actor authenticates; policyTarget is address(0) (no manager slot written).
+    function test_policyTarget_success_ungatedActor_returnsZero(uint256 rootSeed, uint256 sessionSeed, bytes32 hash)
+        public
+    {
         uint256 rootPk = _boundK1Pk(rootSeed);
         uint256 sessionPk = _boundK1Pk(sessionSeed);
         vm.assume(vm.addr(rootPk) != vm.addr(sessionPk));
@@ -572,17 +536,14 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
 
         _authorizeUngatedActor(account, rootPk, sessionActorId, address(k1Authenticator));
 
-        (, uint8 outPolicyType, address policyTarget) =
-            accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
-        assertEq(outPolicyType, POLICY_NONE);
+        (, address policyTarget) = accountConfiguration.authenticateActor(account, hash, _buildK1Auth(sessionPk, hash));
         assertEq(policyTarget, address(0));
     }
 
     /// @notice A gated inline self authenticates; policyTarget resolves to the stored manager via the inline home.
-    function test_resolvePolicyTarget_success_inlineSelfGated_returnsManager(
+    function test_policyTarget_success_inlineSelfGated_returnsManager(
         uint256 eoaSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed,
         bytes32 hash
@@ -591,32 +552,25 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         address eoa = vm.addr(eoaPk);
         bytes32 selfActorId = bytes32(bytes20(eoa));
 
-        uint8 policyType = _boundPolicyType(policyTypeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizeInlineSelfWithPolicy(
-            eoa, eoaPk, _boundGatedScope(scopeSeed), policyType, manager, _boundNonZeroWord(commitmentSeed)
+            eoa, eoaPk, _boundGatedScope(scopeSeed), manager, _boundNonZeroWord(commitmentSeed)
         );
 
-        (, uint8 outPolicyType, address policyTarget) =
-            accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
-        assertEq(outPolicyType, policyType);
+        (, address policyTarget) = accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
         assertEq(policyTarget, manager);
         assertEq(policyTarget, accountConfiguration.getPolicyManager(eoa, selfActorId));
     }
 
-    /// @notice A fresh EOA (implicit full owner, policyType == NONE) authenticates; _resolvePolicyTarget returns
-    ///         address(0) via the NONE branch, over untouched state.
-    function test_resolvePolicyTarget_success_inlineSelfFullOwner_returnsZero(uint256 eoaSeed, bytes32 hash)
-        public
-        view
-    {
+    /// @notice A fresh EOA (implicit full owner, ungated) authenticates; policyTarget is address(0) over untouched
+    ///         state.
+    function test_policyTarget_success_inlineSelfFullOwner_returnsZero(uint256 eoaSeed, bytes32 hash) public view {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
 
-        (uint8 outScope, uint8 outPolicyType, address policyTarget) =
+        (uint8 outScope, address policyTarget) =
             accountConfiguration.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
         assertEq(outScope, uint8(0x00));
-        assertEq(outPolicyType, POLICY_NONE);
         assertEq(policyTarget, address(0));
     }
 
@@ -624,24 +578,17 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     // Fuzz-input bounding helpers
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @dev A policy-bearing actor's scope: non-zero and without the CONFIG bit — i.e. [1,7]. Any value in that
-    ///      range satisfies `_authorizeActor`'s `scope != 0 && scope & SCOPE_CONFIG == 0` guard.
-    function _boundGatedScope(uint8 seed) internal pure returns (uint8) {
-        return uint8(bound(uint256(seed), 1, 7));
+    /// @dev A policy-bearing actor's scope: always carries SCOPE_POLICY, with arbitrary other bits mixed in.
+    function _boundGatedScope(uint8 seed) internal view returns (uint8) {
+        return uint8(seed) | accountConfiguration.SCOPE_POLICY();
     }
 
-    /// @dev A non-zero policy sub-type byte. The protocol treats any non-zero policyType as gated; the specific
-    ///      value is opaque and reserved for manager semantics, so fuzzing the full [1,255] range is valid.
-    function _boundPolicyType(uint8 seed) internal pure returns (uint8) {
-        return uint8(bound(uint256(seed), 1, 255));
-    }
-
-    /// @dev A non-zero policy manager address (`_slicePolicy` rejects a zero manager for a gated actor).
+    /// @dev A non-zero policy manager address (so a written slot is distinguishable from an unwritten one).
     function _boundNonZeroAddress(uint256 seed) internal pure returns (address) {
         return address(uint160(bound(seed, 1, type(uint160).max)));
     }
 
-    /// @dev A non-zero policy commitment word (`_slicePolicy` rejects a zero commitment for a gated actor).
+    /// @dev A non-zero policy commitment word (so a written slot is distinguishable from an unwritten one).
     function _boundNonZeroWord(uint256 seed) internal pure returns (bytes32) {
         return bytes32(bound(seed, 1, type(uint256).max));
     }
@@ -656,13 +603,12 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     }
 
     /// @dev Seed a gated inline-k1 self plus a spare unrestricted owner able to sign a later self-revoke. Returns
-    ///      (eoa, spareOwnerPk). The self is downgraded to a policy scope (no CONFIG bit) and thus cannot sign
-    ///      config changes, so the spare owner is what revokes it.
+    ///      (eoa, spareOwnerPk). The self is downgraded to a policy scope (admin is exactly scope == 0) and thus
+    ///      cannot sign config changes, so the spare owner is what revokes it.
     function _seedGatedInlineSelfWithSpareOwner(
         uint256 eoaSeed,
         uint256 ownerSeed,
         uint8 scopeSeed,
-        uint8 policyTypeSeed,
         uint256 managerSeed,
         uint256 commitmentSeed
     ) internal returns (address eoa, uint256 ownerPk) {
@@ -681,7 +627,6 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
             eoa,
             eoaPk,
             _boundGatedScope(scopeSeed),
-            _boundPolicyType(policyTypeSeed),
             _boundNonZeroAddress(managerSeed),
             _boundNonZeroWord(commitmentSeed)
         );
@@ -692,17 +637,17 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
     /// @dev Authorize a non-self actor with a gated policy bound to (manager, commitment), signed by the root owner.
+    ///      `scope` must carry SCOPE_POLICY.
     function _authorizePolicyActor(
         address account,
         uint256 rootPk,
         bytes32 actorId,
         uint8 scope,
-        uint8 policyType,
         address policyManager,
         bytes32 commitment
     ) internal {
         AccountConfiguration.ActorConfig memory cfg = AccountConfiguration.ActorConfig({
-            authenticator: address(k1Authenticator), scope: scope, expiry: 0, policyType: policyType
+            authenticator: address(k1Authenticator), scope: scope, expiry: 0
         });
         bytes memory policyData = abi.encodePacked(policyManager, commitment);
 
@@ -725,13 +670,12 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         address eoa,
         uint256 eoaPk,
         uint8 scope,
-        uint8 policyType,
         address policyManager,
         bytes32 commitment
     ) internal {
         bytes32 selfActorId = bytes32(bytes20(eoa));
         AccountConfiguration.ActorConfig memory cfg = AccountConfiguration.ActorConfig({
-            authenticator: accountConfiguration.K1_AUTHENTICATOR(), scope: scope, expiry: 0, policyType: policyType
+            authenticator: accountConfiguration.K1_AUTHENTICATOR(), scope: scope, expiry: 0
         });
         bytes memory policyData = abi.encodePacked(policyManager, commitment);
 
@@ -745,17 +689,14 @@ contract PolicyAccessorsTest is AccountConfigurationTest {
         accountConfiguration.applySignedActorChanges(eoa, uint64(block.chainid), changes, _buildK1Auth(eoaPk, digest));
     }
 
-    /// @dev Authorize an ungated (scope 0, policyType NONE) actor under `authenticator`, signed by `pk`.
+    /// @dev Authorize an ungated (scope 0) actor under `authenticator`, signed by `pk`.
     function _authorizeUngatedActor(address account, uint256 pk, bytes32 newActorId, address authenticator) internal {
         AccountConfiguration.ActorChange[] memory changes = new AccountConfiguration.ActorChange[](1);
         changes[0] = AccountConfiguration.ActorChange({
             actorId: newActorId,
             changeType: AUTHORIZE_ACTOR,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: authenticator, scope: 0x00, expiry: 0, policyType: 0x00
-                }),
-                bytes("")
+                AccountConfiguration.ActorConfig({authenticator: authenticator, scope: 0x00, expiry: 0}), bytes("")
             )
         });
         uint64 seq = accountConfiguration.getChangeSequences(account).local;

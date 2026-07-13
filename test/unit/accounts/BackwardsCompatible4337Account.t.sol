@@ -28,9 +28,9 @@ contract UserOpMockTarget {
 contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
     uint256 constant ACTOR_PK = 100;
 
-    uint8 constant SCOPE_SIGNER = 0x01;
-    uint8 constant SCOPE_SENDER = 0x02;
-    uint8 constant SCOPE_PAYER = 0x04;
+    uint8 constant SCOPE_SENDER = 0x01;
+    uint8 constant SCOPE_SELF_PAYER = 0x08;
+    uint8 constant SCOPE_SPONSOR_PAYER = 0x10;
 
     bytes32 constant SIGNED_ACTOR_CHANGES_MAGIC = keccak256("ERC4337Account.signedActorChanges.v1");
 
@@ -48,10 +48,11 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
     ///      model has no hardcoded EntryPoint). Returns (account, ownerActorId).
     function _create4337Account(uint256 pk) internal returns (address account, bytes32 actorId) {
         actorId = bytes32(bytes20(vm.addr(pk)));
-        AccountConfiguration.InitialActor memory owner =
-            AccountConfiguration.InitialActor({actorId: actorId, authenticator: address(k1Authenticator)});
+        AccountConfiguration.InitialActor memory owner = AccountConfiguration.InitialActor({
+            actorId: actorId, authenticator: address(k1Authenticator), scope: 0, policyData: ""
+        });
         AccountConfiguration.InitialActor memory ep = AccountConfiguration.InitialActor({
-            actorId: bytes32(bytes20(ENTRY_POINT)), authenticator: TRUSTED_EXECUTOR
+            actorId: bytes32(bytes20(ENTRY_POINT)), authenticator: TRUSTED_EXECUTOR, scope: 0, policyData: ""
         });
 
         AccountConfiguration.InitialActor[] memory actors = new AccountConfiguration.InitialActor[](2);
@@ -93,27 +94,26 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
     }
 
     /// @dev Authorizes a new K1 actor on `account` with the given scope/policy, signed by the unrestricted owner
-    ///      (`ownerPk`) via `applySignedActorChanges`. Returns the new actor's id.
+    ///      (`ownerPk`) via `applySignedActorChanges`. Returns the new actor's id. Policy data is attached whenever
+    ///      `scope` carries SCOPE_POLICY.
     function _authorizeScopedActor(
         address account,
         uint256 ownerPk,
         uint256 newPk,
         uint8 scope,
-        uint8 policyType,
         address policyManager,
         bytes32 commitment
     ) internal returns (bytes32 newActorId) {
         newActorId = bytes32(bytes20(vm.addr(newPk)));
-        bytes memory policyData = policyType == 0 ? bytes("") : abi.encodePacked(policyManager, commitment);
+        bytes memory policyData =
+            scope & accountConfiguration.SCOPE_POLICY() == 0 ? bytes("") : abi.encodePacked(policyManager, commitment);
 
         AccountConfiguration.ActorChange[] memory changes = new AccountConfiguration.ActorChange[](1);
         changes[0] = AccountConfiguration.ActorChange({
             actorId: newActorId,
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: address(k1Authenticator), scope: scope, expiry: 0, policyType: policyType
-                }),
+                AccountConfiguration.ActorConfig({authenticator: address(k1Authenticator), scope: scope, expiry: 0}),
                 policyData
             )
         });
@@ -136,9 +136,7 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
             actorId: newActorId,
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: address(k1Authenticator), scope: 0x00, expiry: 0, policyType: 0x00
-                }),
+                AccountConfiguration.ActorConfig({authenticator: address(k1Authenticator), scope: 0x00, expiry: 0}),
                 bytes("")
             )
         });
@@ -182,9 +180,7 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
             actorId: bytes32(bytes20(relayer)),
             changeType: 0x01,
             data: abi.encode(
-                AccountConfiguration.ActorConfig({
-                    authenticator: TRUSTED_EXECUTOR, scope: SCOPE_SENDER, expiry: 0, policyType: 0
-                }),
+                AccountConfiguration.ActorConfig({authenticator: TRUSTED_EXECUTOR, scope: SCOPE_SENDER, expiry: 0}),
                 bytes("")
             )
         });
@@ -369,27 +365,39 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
         assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 1);
     }
 
-    // ── SIGNER scope (ERC-1271) ──
+    // ── ERC-1271 signing (operational authority) ──
 
-    function test_isValidSignature_requiresSignerScope() public {
+    function test_isValidSignature_nonOperationalActorCannotSign() public {
         (address account,) = _create4337Account(ACTOR_PK);
-        uint256 senderOnlyPk = 201;
-        _authorizeScopedActor(account, ACTOR_PK, senderOnlyPk, SCOPE_SENDER, 0, address(0), bytes32(0));
+        uint256 scopedPk = 201;
+        // A payer-only (non-SENDER) actor is not operational.
+        _authorizeScopedActor(account, ACTOR_PK, scopedPk, SCOPE_SPONSOR_PAYER, address(0), bytes32(0));
 
         bytes32 hash = keccak256("sign me");
-        bytes memory authData = _buildK1Auth(senderOnlyPk, hash);
+        bytes memory authData = _buildK1Auth(scopedPk, hash);
 
-        // A SENDER-only actor lacks SIGNER scope, so ERC-1271 validation must fail.
+        // A non-operational scoped actor cannot ERC-1271 sign, so validation must fail.
         assertEq(DefaultAccount(payable(account)).isValidSignature(hash, authData), bytes4(0xFFFFFFFF));
     }
 
-    function test_isValidSignature_signerScopeSucceeds() public {
+    function test_isValidSignature_operationalSenderSigns() public {
         (address account,) = _create4337Account(ACTOR_PK);
-        uint256 signerPk = 202;
-        _authorizeScopedActor(account, ACTOR_PK, signerPk, SCOPE_SIGNER, 0, address(0), bytes32(0));
+        uint256 senderPk = 202;
+        // A SENDER-without-POLICY actor is operational and can ERC-1271 sign.
+        _authorizeScopedActor(account, ACTOR_PK, senderPk, SCOPE_SENDER, address(0), bytes32(0));
 
         bytes32 hash = keccak256("sign me");
-        bytes memory authData = _buildK1Auth(signerPk, hash);
+        bytes memory authData = _buildK1Auth(senderPk, hash);
+
+        assertEq(DefaultAccount(payable(account)).isValidSignature(hash, authData), bytes4(0x1626ba7e));
+    }
+
+    function test_isValidSignature_adminSucceeds() public {
+        (address account,) = _create4337Account(ACTOR_PK);
+
+        // The unrestricted admin actor (scope == 0x00) is operational and can ERC-1271 sign.
+        bytes32 hash = keccak256("sign me");
+        bytes memory authData = _buildK1Auth(ACTOR_PK, hash);
 
         assertEq(DefaultAccount(payable(account)).isValidSignature(hash, authData), bytes4(0x1626ba7e));
     }
@@ -399,7 +407,7 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
     function test_validateUserOp_senderScopeAuthorizes() public {
         (address account,) = _create4337Account(ACTOR_PK);
         uint256 senderPk = 203;
-        _authorizeScopedActor(account, ACTOR_PK, senderPk, SCOPE_SENDER, 0, address(0), bytes32(0));
+        _authorizeScopedActor(account, ACTOR_PK, senderPk, SCOPE_SENDER, address(0), bytes32(0));
 
         bytes32 userOpHash = keccak256("op");
         PackedUserOperation memory userOp = _buildUserOp(account, _buildK1Auth(senderPk, userOpHash));
@@ -410,38 +418,38 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
 
     function test_validateUserOp_requiresSenderScope() public {
         (address account,) = _create4337Account(ACTOR_PK);
-        uint256 signerOnlyPk = 204;
-        _authorizeScopedActor(account, ACTOR_PK, signerOnlyPk, SCOPE_SIGNER, 0, address(0), bytes32(0));
+        uint256 nonSenderPk = 204;
+        _authorizeScopedActor(account, ACTOR_PK, nonSenderPk, SCOPE_SPONSOR_PAYER, address(0), bytes32(0));
 
         bytes32 userOpHash = keccak256("op");
-        PackedUserOperation memory userOp = _buildUserOp(account, _buildK1Auth(signerOnlyPk, userOpHash));
+        PackedUserOperation memory userOp = _buildUserOp(account, _buildK1Auth(nonSenderPk, userOpHash));
 
-        // A SIGNER-only actor cannot initiate transactions: no SENDER scope.
+        // An actor without SENDER scope cannot initiate transactions.
         vm.prank(ENTRY_POINT);
         assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 1);
     }
 
-    // ── PAYER scope (self-funded ops) ──
+    // ── SELF_PAYER scope (self-funded ops) ──
 
-    function test_validateUserOp_selfFundedRequiresPayerScope() public {
+    function test_validateUserOp_selfFundedRequiresSelfPayerScope() public {
         (address account,) = _create4337Account(ACTOR_PK);
         vm.deal(account, 1 ether);
         uint256 senderOnlyPk = 205;
-        _authorizeScopedActor(account, ACTOR_PK, senderOnlyPk, SCOPE_SENDER, 0, address(0), bytes32(0));
+        _authorizeScopedActor(account, ACTOR_PK, senderOnlyPk, SCOPE_SENDER, address(0), bytes32(0));
 
         bytes32 userOpHash = keccak256("op");
         PackedUserOperation memory userOp = _buildUserOp(account, _buildK1Auth(senderOnlyPk, userOpHash));
 
-        // SENDER but not PAYER: cannot authorize spending the account's funds on gas.
+        // SENDER but not SELF_PAYER: cannot authorize spending the account's funds on gas.
         vm.prank(ENTRY_POINT);
         assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0.1 ether), 1);
     }
 
-    function test_validateUserOp_senderPayerScope_selfFundedSucceeds() public {
+    function test_validateUserOp_senderSelfPayerScope_selfFundedSucceeds() public {
         (address account,) = _create4337Account(ACTOR_PK);
         vm.deal(account, 1 ether);
         uint256 pk = 206;
-        _authorizeScopedActor(account, ACTOR_PK, pk, SCOPE_SENDER | SCOPE_PAYER, 0, address(0), bytes32(0));
+        _authorizeScopedActor(account, ACTOR_PK, pk, SCOPE_SENDER | SCOPE_SELF_PAYER, address(0), bytes32(0));
 
         bytes32 userOpHash = keccak256("op");
         PackedUserOperation memory userOp = _buildUserOp(account, _buildK1Auth(pk, userOpHash));
@@ -450,35 +458,42 @@ contract BackwardsCompatible4337AccountTest is AccountConfigurationTest {
         assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0.1 ether), 0);
     }
 
-    // ── Policy gating (calls confined to policy target) ──
+    // ── SCOPE_POLICY (no native-dispatch call-target gating in this reduced 4337 bridge) ──
 
-    function test_validateUserOp_policyGated_allowsCallsToPolicyTarget() public {
+    function test_validateUserOp_policyScopeOnly_rejectedForLackingSenderScope() public {
         (address account,) = _create4337Account(ACTOR_PK);
         address policyManager = address(0xB0B);
         uint256 pk = 207;
-        _authorizeScopedActor(account, ACTOR_PK, pk, SCOPE_SENDER, 0x01, policyManager, keccak256("commit"));
+        _authorizeScopedActor(
+            account, ACTOR_PK, pk, accountConfiguration.SCOPE_POLICY(), policyManager, keccak256("commit")
+        );
 
+        // A pure-SCOPE_POLICY actor lacks SCOPE_SENDER, so this reduced 4337 bridge rejects it outright — it does
+        // not replicate native-dispatch's policy-target call gating.
         bytes memory callData = _executeBatchCallData(policyManager, 0, abi.encodeCall(UserOpMockTarget.setValue, (1)));
         bytes32 userOpHash = keccak256(abi.encode("op", callData));
         PackedUserOperation memory userOp = _buildUserOp(account, callData, _buildK1Auth(pk, userOpHash));
 
         vm.prank(ENTRY_POINT);
-        assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 0);
+        assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 1);
     }
 
-    function test_validateUserOp_policyGated_rejectsCallsToOtherTarget() public {
+    function test_validateUserOp_policyAndSenderScope_authorizedWithoutTargetGating() public {
         (address account,) = _create4337Account(ACTOR_PK);
         address policyManager = address(0xB0B);
         uint256 pk = 208;
-        _authorizeScopedActor(account, ACTOR_PK, pk, SCOPE_SENDER, 0x01, policyManager, keccak256("commit"));
+        uint8 scope = SCOPE_SENDER | accountConfiguration.SCOPE_POLICY();
+        _authorizeScopedActor(account, ACTOR_PK, pk, scope, policyManager, keccak256("commit"));
 
-        // Call targets the MockTarget directly, escaping the actor's policy gate.
+        // An actor combining SCOPE_POLICY | SCOPE_SENDER is authorized here exactly like any other SENDER-scoped
+        // actor: this reduced 4337 bridge does not confine its calls to the policy target (that enforcement is
+        // native-dispatch, protocol-side behavior out of scope for this repo).
         bytes memory callData =
             _executeBatchCallData(address(target), 0, abi.encodeCall(UserOpMockTarget.setValue, (1)));
         bytes32 userOpHash = keccak256(abi.encode("op", callData));
         PackedUserOperation memory userOp = _buildUserOp(account, callData, _buildK1Auth(pk, userOpHash));
 
         vm.prank(ENTRY_POINT);
-        assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 1);
+        assertEq(BackwardsCompatible4337Account(payable(account)).validateUserOp(userOp, userOpHash, 0), 0);
     }
 }
