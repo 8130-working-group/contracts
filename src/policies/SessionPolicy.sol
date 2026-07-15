@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 
-import {Call, DefaultAccount} from "../../accounts/DefaultAccount.sol";
+import {Call, DefaultAccount} from "../accounts/DefaultAccount.sol";
 import {Policy} from "./Policy.sol";
 import {RecurringAllowance} from "./RecurringAllowance.sol";
 
@@ -26,9 +26,24 @@ import {RecurringAllowance} from "./RecurringAllowance.sol";
 ///        - A recipient allowlist may only be attached to one of those selectors (enforced at install).
 ///        - Spend limits are consumed only for those selectors when called on a limited token (`approve` included,
 ///          so an allowance grant cannot exceed the remaining budget). `anySelector` on a limited token is rejected
-///          at install; pin an explicit selector allowlist instead. Non-spend selectors on a limited token are still
-///          governed only by that allowlist — do not list methods that move value outside the tracked set.
+///          at install; pin an explicit selector allowlist instead.
+///        - WARNING: any *other* selector on a limited token is gated by the allowlist but NOT debited from the
+///          cap. Value-moving methods this policy cannot decode — e.g. ERC-20 `increaseAllowance`/`decreaseAllowance`,
+///          ERC-721 `safeTransferFrom`, any ERC-1155 transfer — therefore bypass the spend cap entirely if listed.
+///          Do NOT allow such selectors on a token you are trying to bound; only `transfer`/`transferFrom`/`approve`
+///          are tracked.
 ///        - Native-ETH limits are consumed from each call's `value`, independent of calldata.
+///
+///      Approvals vs. periods: `approve` is debited from the *current* period at grant time, but an ERC-20 allowance
+///      is standing on-chain state that outlives the period and is pulled by a third party this policy never sees. A
+///      grantee can therefore pull a still-live approval from an earlier period in the same wall-clock window as a
+///      fresh-period `transfer`, so real token outflow across a period boundary can exceed a single period's cap.
+///      Per-period accounting is exact for the key's own actions; it cannot bound reuse of standing allowances.
+///
+///      Calldata length: empty calldata is allowed (a `receive()` / plain value transfer, gated by the target
+///      allowlist and native-ETH cap); calldata of 1–3 bytes is rejected ({MissingSelector}) as it cannot carry a
+///      4-byte selector; 4+ bytes is treated as a selector (so a fallback reachable via 4+ byte data is gated by the
+///      selector rules).
 contract SessionPolicy is Policy {
     using RecurringAllowance for RecurringAllowance.State;
 
@@ -141,6 +156,13 @@ contract SessionPolicy is Policy {
     ///         without debiting the spend cap. Native-ETH limits (`token == address(0)`) are unaffected — they gate
     ///         call `value`, not a call target.
     error AnySelectorOnLimitedToken(address token);
+    /// @notice A call scope targeted the account itself. The account is always an authorized caller of its own
+    ///         `executeBatch`, so allowing a session key to call it would let the key re-enter with an arbitrary
+    ///         batch that bypasses every policy check. Reject at install to fail closed.
+    error SelfTargetNotAllowed();
+    /// @notice A `transferFrom` moved funds from an address other than the account. A session key may only spend the
+    ///         account's own resources, not third-party allowances the account happens to hold.
+    error TransferFromNotSelf(address from);
 
     constructor(address policyManager) Policy(policyManager) {}
 
@@ -240,7 +262,7 @@ contract SessionPolicy is Policy {
     ///      {AnySelectorOnLimitedToken} when a limited token would be left with untracked selectors) and, per
     ///      selector rule, whether a recipient allowlist applies (rejecting {RecipientRuleUnsupportedSelector} for a
     ///      selector whose recipient cannot be decoded) plus the recipient set itself.
-    function _onInstall(bytes32 commitment, address, bytes calldata policyConfig) internal override {
+    function _onInstall(bytes32 commitment, address account, bytes calldata policyConfig) internal override {
         Config memory config = abi.decode(policyConfig, (Config));
 
         for (uint256 i; i < config.tokenLimits.length; i++) {
@@ -254,6 +276,9 @@ contract SessionPolicy is Policy {
 
         for (uint256 i; i < config.callScopes.length; i++) {
             CallScope memory scope = config.callScopes[i];
+            // Fail closed: the account is always authorized to call its own executeBatch, so a session key allowed to
+            // target the account could re-enter with an arbitrary, unchecked batch and escape every policy dimension.
+            if (scope.target == account) revert SelfTargetNotAllowed();
             bool anySelector = scope.selectorRules.length == 0;
             // Fail closed: a TokenLimit on this target only tracks transfer/transferFrom/approve, so anySelector
             // would let other methods move value untracked. Require an explicit selector allowlist instead.
@@ -284,7 +309,7 @@ contract SessionPolicy is Policy {
     ///      ({RecipientNotAllowed}); the ERC-20 spend cap for decodable spend selectors on a limited token; and the
     ///      native-ETH spend cap consumed from the call `value`. Calldata of 1–3 bytes is rejected ({MissingSelector}).
     ///      On success returns the `executeBatch` calldata for a single {Call} mirroring the action.
-    function _onExecute(bytes32 commitment, address, bytes calldata executionData, address)
+    function _onExecute(bytes32 commitment, address account, bytes calldata executionData, address)
         internal
         override
         returns (bytes memory accountCallData)
@@ -310,7 +335,15 @@ contract SessionPolicy is Policy {
                 }
             }
 
-            // 3a. ERC-20 spend limit: consume the target token's cap for decodable spend selectors.
+            // 3. transferFrom source: a session key spends only the account's own resources, never a third-party
+            // allowance the account holds. Enforce `from == account` regardless of token limits or recipient rules.
+            if (selector == TRANSFER_FROM) {
+                address from = _decodeTransferFromSender(action.data);
+                if (from != account) revert TransferFromNotSelf(from);
+            }
+
+            // 3a. ERC-20 spend limit: consume the target token's cap for decodable spend selectors. Note `approve`
+            // debits at grant time; a standing allowance can still be reused across periods (see contract NatSpec).
             if (_isErc20Selector(selector)) {
                 TokenSpend storage tokenCap = _tokenSpend[commitment][action.target];
                 if (tokenCap.set) {
@@ -390,5 +423,16 @@ contract SessionPolicy is Policy {
         }
         // Truncate to the low 160 bits: ABI pads the high bytes, but a caller could dirty them.
         recipient = address(uint160(recipientWord));
+    }
+
+    /// @dev Decode the `from` (source) address of a `transferFrom(address from, address to, uint256 amount)` call.
+    function _decodeTransferFromSender(bytes memory data) internal pure returns (address from) {
+        if (data.length < 4 + 96) revert MalformedTokenCall(TRANSFER_FROM);
+        uint256 fromWord;
+        assembly ("memory-safe") {
+            fromWord := mload(add(data, 0x24))
+        }
+        // Truncate to the low 160 bits: ABI pads the high bytes, but a caller could dirty them.
+        from = address(uint160(fromWord));
     }
 }
