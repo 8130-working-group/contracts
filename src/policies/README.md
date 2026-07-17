@@ -15,26 +15,20 @@ protocol-side, not enforced by this contract.
 1. **Authorize + commit.** The account authorizes the session key with `scope = SCOPE_POLICY`,
    `policy_manager = PolicyManager`, and `policy_commitment = keccak256` of an account-authorized
    [`PolicyBinding`](./PolicyManager.sol). The Account Configuration contract exposes this via
-   [`getPolicy(account, actorId)`](../../AccountConfiguration.sol).
-2. **Install.** Anyone (the account itself, the session key, or a third party) calls
-   `PolicyManager.install(actorId, binding)`. The manager re-derives the commitment and confirms `getPolicy`
-   resolves to `(this, commitment)` — so an install can only succeed for a policy the account actually signed for
-   this manager, which is what makes the call permissionless. The committed `policyConfig` is then handed to the
-   policy's install hook, which stores it keyed by commitment. Install is one-shot per commitment, so it can never
-   reset an installed binding's accounting (e.g. spend counters); changing any binding field yields a different
-   commitment — a separate, independently-accounted binding.
-3. **Use.** When the session key transacts, the protocol gate resolves the key's allowed target
+   [`getPolicy(account, actorId)`](../../AccountConfiguration.sol). That signed actor change *is* the
+   authorization — there is no separate install step on the manager.
+2. **Use.** When the session key transacts, the protocol gate resolves the key's allowed target
    (`policy_manager(account, actorId)`) and reverts any call whose `call.to` isn't that address before dispatch, so
-   the key's call can only arrive at `PolicyManager.execute(policy, executionData)` with `msg.sender == account`.
-   Because reaching this manager already proves it is the key's gate, `execute` does not re-check the target: it
-   reads the acting `actorId` from the [transaction-context precompile](../../interfaces/ITransactionContext.sol)
-   (`getTransactionSenderActorId()`) and needs the live `getPolicyCommitment(account, actorId)` (a single SLOAD)
-   to locate the installed binding — a revoked key has a zero commitment and stops immediately. (A real binding's
-   commitment is a `keccak256` hash, never zero, so this manager treats a `SCOPE_POLICY` actor configured with a
-   zero `commitment` as having no active policy — there is nothing installable to enforce.) Actor expiry is
-   checked separately via `getActorConfig` (expiry does not clear the commitment slot). It then invokes the policy,
-   which enforces the committed policy against the per-use action and returns an `executeBatch` call plan that the
-   manager — an execution-enabled actor (`TRUSTED_EXECUTOR`) — forwards to the account.
+   the key's call can only arrive at `PolicyManager.execute(binding, executionData)` with `msg.sender == account`.
+   The caller supplies the full [`PolicyBinding`](./PolicyManager.sol); the manager recomputes
+   `commitment = keccak256(account, policy, keccak256(policyConfig), validAfter, validUntil, salt)` and requires it
+   to equal the live `getPolicyCommitment(account, actorId)`. That single check authenticates config, validity
+   window, and owning account — so neither the manager nor the policy stores a config hash (strictly better than
+   [Account Policies](https://github.com/base/account-policies)' per-binding `_configHashByPolicyId` slot). A
+   revoked key has a zero commitment and stops immediately. Actor expiry is not re-checked on this path: protocol
+   authentication already rejects expired actors before dispatch. (The external `executeFor` path does enforce
+   expiry.) The manager then invokes the policy, forwards a non-empty `executeBatch` plan to the account, and
+   calls `onPostExecute` when applicable.
 
 ```
 session key ──(8130 gate: only PolicyManager)──▶ PolicyManager.execute
@@ -47,28 +41,26 @@ session key ──(8130 gate: only PolicyManager)──▶ PolicyManager.execute
 
 | Contract | Role |
 |----------|------|
-| `PolicyManager` | Minimal manager: install (permissionless) verifies the account's signed commitment; `execute` (account-acting) reads the acting actor from the transaction-context precompile; `executeFor` / `executeForMany` (external-caller) let an authorized outside party drive one or many accounts. All paths run the policy → `account.executeBatch`. |
-| `Policy` | Base hook: `onInstall` (store committed config) + `onExecute` (enforce + build call plan). |
-| `SessionPolicy` | Unified "session key" policy: combines a target allowlist, per-target selector rules, per-selector recipient allowlists, and per-token (and native-ETH) recurring/one-time spend limits — all enforced atomically on each call. |
+| `PolicyManager` | Stateless manager: `execute(binding, …)` / `executeFor(binding, …)` / `executeForMany(bindings[], …)` re-authenticate the full binding against the live signed commitment in AccountConfiguration, then run policy → account call → `onPostExecute`. |
+| `Policy` | Base hook: `onExecute` → `(accountCallData, postCallData)` + `onPostExecute` (default no-op). |
+| `SessionPolicy` | Unified "session key" policy: target / selector / recipient / spend limits enforced by linear scan over calldata config. Stores only spend usage. Validates config shape at execute. |
 | `RecurringAllowance` | Periodic-allowance accounting library (ported from base/account-policies); used by `SessionPolicy` for spend accounting. |
 
-A key that needs several independent bindings installs each separately; the manager routes each by commitment.
+A key that needs several independent bindings authorizes each separately (distinct commitments); the manager routes each by commitment.
 
 ### `SessionPolicy`: one policy, many dimensions
 
-The manager validates exactly **one** `(policy, commitment)` per `execute` call, so installing several focused
-policies cannot *jointly* gate the **same** call (each binding is checked in isolation). `SessionPolicy` is the
-pattern for "this one call must satisfy target **and** selector **and** recipient **and** spend-limit": it decodes
-its committed config into commitment-keyed mappings at install, so each `onExecute` resolves every dimension with
-O(1) SLOADs. Per-call cost therefore tracks the constraints actually configured, so configure only the dimensions a
-given key needs.
+The manager validates exactly **one** binding per `execute` call, so authorizing several focused policies cannot
+*jointly* gate the **same** call. `SessionPolicy` is the pattern for "this one call must satisfy target **and**
+selector **and** recipient **and** spend-limit": each `onExecute` validates config shape then scans the
+authenticated calldata config. Only mutable spend usage lives onchain.
 
 Recipient allowlists and spend-limit accounting require decoding a call's arguments, which is only possible for
 selectors whose ABI is known: `SessionPolicy` hardcodes the standard ERC-20 set (`transfer`, `transferFrom`,
-`approve`). A recipient allowlist may only be attached to one of those (enforced at install); spend limits are
+`approve`). A recipient allowlist may only be attached to one of those (enforced at execute); spend limits are
 consumed for those selectors on a limited token (`approve` included, so an allowance cannot exceed the remaining
 budget), native-ETH limits from each call's `value`, and every other selector is governed by target/selector gating
-alone. `anySelector` on a limited token is rejected at install — pin an explicit selector allowlist instead.
+alone. `anySelector` on a limited token is rejected at execute — pin an explicit selector allowlist instead.
 
 #### Worked example
 
@@ -106,7 +98,7 @@ scopes[2] = SessionPolicy.CallScope({target: MYAPP, selectorRules: appRules});
 bytes memory policyConfig = abi.encode(SessionPolicy.Config({tokenLimits: limits, callScopes: scopes}));
 ```
 
-With that installed, the key may transfer any amount of the MyApp token, spend up to $5 of USDC per rolling month
+With that authorized, the key may transfer any amount of the MyApp token, spend up to $5 of USDC per rolling month
 (refreshing the next month), and call `stake` / `claim` on MyApp without limit — while a USDC transfer over budget
 reverts `ExceededAllowance`, a third MyApp selector reverts `SelectorNotAllowed`, and any other contract reverts
 `TargetNotAllowed`. Two choices to note: modeling "full token access" as *any selector* also permits `approve` /
@@ -122,23 +114,21 @@ isn't a key on the account at all — e.g. a **subscription provider** that want
 from many accounts, rather than each account running its own session key. For that, identity must come from the
 caller, not the protocol.
 
-`executeFor(account, policy, executionData)` is the external-caller entrypoint:
+`executeFor(binding, executionData)` is the external-caller entrypoint:
 
 - **Identity is the caller:** `actorId = bytes20(msg.sender)`, and `account` is an explicit argument. The caller
   can't forge the identity because it's derived from `msg.sender`.
 - **No protocol routing, so the manager re-checks itself:** it re-adds the `policy_manager(account, actorId) ==
   address(this)` check that the account-acting `execute` omits (the 8130 gate guarantees routing only on the
   dispatched path). So a provider can only pull through the exact manager the account authorized.
-- **One identity, many accounts:** `executeForMany(accounts[], policy, executionData[])` runs each account in its
-  own self-call so a single failure (revoked/expired binding, over budget, a reverting account call) is **isolated
-  and skipped** (emitting `ExecutionSkipped`) rather than reverting the whole batch — one delinquent subscriber
-  doesn't block the rest.
+- **One identity, many accounts:** `executeForMany(bindings[], executionData[])` runs each binding in its own
+  self-call so a single failure is **isolated and skipped** (emitting `ExecutionSkipped`) rather than reverting the
+  whole batch — one delinquent subscriber doesn't block the rest.
 
 **Opt-in (per account, once).** The account's only on-chain obligation is a single **off-chain signature** over an
-actor change. Because `applySignedActorChanges` is signature-gated and `install` is permissionless (gated by the
-signed commitment, not by `msg.sender`), the provider can submit everything itself — apply the signed change,
-`install`, then `executeFor` — so the account never needs to send a transaction. The account authorizes the provider
-as a *policy-only* actor — it has no authority of its own, it only carries a binding the manager enforces:
+actor change. Because `applySignedActorChanges` is signature-gated, the provider can submit the signed change and
+then `executeFor` — so the account never needs to send a transaction. The account authorizes the provider as a
+*policy-only* actor — it has no authority of its own, it only carries a binding the manager enforces:
 
 ```solidity
 // actorId = bytes20(provider). The provider never signs an 8130 tx; it acts by being msg.sender.
@@ -162,5 +152,5 @@ nor authenticate an 8130 transaction. Give the provider its **own salt** so its 
 spend budget — is isolated from any session keys on the account. End-to-end tests:
 [`ExternalPolicyCaller.t.sol`](../../../test/unit/examples/ExternalPolicyCaller.t.sol).
 
-> Out of scope for this reference: signature-based install, replacement, and uninstall. See
+> Out of scope for this reference: signature-based replacement and uninstall. See
 > [base/account-policies](https://github.com/base/account-policies) for a fuller policy framework.
