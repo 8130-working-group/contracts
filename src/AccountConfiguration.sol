@@ -619,7 +619,7 @@ contract AccountConfiguration {
     ///      reverts on failure, so it is called externally and the revert is caught.
     ///
     /// @param account The account the signature is validated against.
-    /// @param hash The digest that was signed.
+    /// @param hash The raw digest; authenticated as replaySafeHash(account, hash).
     /// @param signature Authenticator(20) || authenticator-specific data.
     ///
     /// @return verified True if the signature is valid and the resolved actor is operational (admin, or a SENDER
@@ -629,7 +629,10 @@ contract AccountConfiguration {
         view
         returns (bool verified)
     {
-        try this.authenticateActor(account, hash, signature) returns (bytes32, uint8 scope, address) {
+        // Authenticate against the account-scoped digest (see {replaySafeHash}), not the raw hash.
+        try this.authenticateActor(account, replaySafeHash(account, hash), signature) returns (
+            bytes32, uint8 scope, address
+        ) {
             // ERC-1271 signing is authorized for any operational actor: the admin (scope == 0x00), or a SENDER actor
             // that is not gated by a policy (SCOPE_SENDER set AND SCOPE_POLICY unset). Signing is an encoding of
             // authority a SENDER actor already holds via calls, not a separate grant, so it needs no dedicated scope
@@ -639,6 +642,42 @@ contract AccountConfiguration {
         } catch {
             return false;
         }
+    }
+
+    // Account-scoped ERC-1271: signatures are authenticated against replaySafeHash(account, hash), an EIP-712
+    // digest with verifyingContract = account, binding a 1271 signature to a single account. This is the EIP-7739
+    // PersonalSign digest; TypedDataSign is not implemented. The registry's own signed messages (actor changes,
+    // import, lock) bind context in-struct and do not use this domain.
+
+    /// @dev EIP-712 domain typehash.
+    bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    /// @dev keccak256("PersonalSign(bytes prefixed)").
+    bytes32 private constant _PERSONAL_SIGN_TYPEHASH =
+        0x983e65e5148e570cd828ead231ee759a8d7958721a768f93bc4483ba005c32de;
+
+    /// @dev Account ERC-1271 domain name/version, fixed for all accounts.
+    bytes32 private constant _ACCOUNT_DOMAIN_NAME_HASH = keccak256("EIP8130Account");
+    bytes32 private constant _ACCOUNT_DOMAIN_VERSION_HASH = keccak256("1");
+
+    /// @notice Account-scoped digest to sign for `hash` to be accepted by {verifySignature}: `hash` wrapped in an
+    ///         EIP-712 domain with verifyingContract = `account` and the current chainId.
+    /// @param account Account the signature is bound to.
+    /// @param hash Raw message digest.
+    /// @return The digest to sign.
+    function replaySafeHash(address account, bytes32 hash) public view returns (bytes32) {
+        bytes32 structHash = keccak256(abi.encode(_PERSONAL_SIGN_TYPEHASH, hash));
+        return keccak256(abi.encodePacked(hex"1901", _accountDomainSeparator(account), structHash));
+    }
+
+    /// @dev EIP-712 domain separator for `account`'s ERC-1271 domain (verifyingContract = account, current chainId).
+    function _accountDomainSeparator(address account) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                _EIP712_DOMAIN_TYPEHASH, _ACCOUNT_DOMAIN_NAME_HASH, _ACCOUNT_DOMAIN_VERSION_HASH, block.chainid, account
+            )
+        );
     }
 
     /// @notice Authenticates that an account approved `hash` using auth in `authenticator(20) || data` format,
