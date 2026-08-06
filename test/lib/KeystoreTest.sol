@@ -54,9 +54,8 @@ contract KeystoreTest is Test {
 
     // ── Actor liveness helper ──
 
-    /// @dev Liveness check via the public getActorConfig (authenticator != 0). Replaces the removed public isActor
-    ///      getter. Unlike the old isActor, this honors expiry (getActorConfig resolves an expired actor to empty),
-    ///      which is the intended public liveness semantics.
+    /// @dev Liveness check via the public getActorConfig (authenticator != 0). Expiry-aware: getActorConfig resolves
+    ///      an expired, revoked, or disabled actor to the all-zero config.
     function _isActor(address account, bytes32 actorId) internal view returns (bool) {
         return keystore.getActorConfig(account, actorId).authenticator != address(0);
     }

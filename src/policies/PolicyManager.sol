@@ -8,14 +8,16 @@ import {Keystore} from "../Keystore.sol";
 import {ITransactionContext, TX_CONTEXT_ADDRESS} from "../interfaces/ITransactionContext.sol";
 import {Policy} from "./Policy.sol";
 
-/// @dev Recommended `authenticator` for an actor that represents an *external caller* governed by a policy (e.g. a
+/// @dev Required `authenticator` for an actor that represents an *external caller* governed by a policy (e.g. a
 ///      subscription provider): an address that may act ONLY through its policy manager's external entrypoints, never
 ///      directly. Distinct from `TRUSTED_EXECUTOR` (which grants direct `executeBatch`): this is a
 ///      no-code, hash-derived sentinel, so the actor is recognized by Keystore (non-zero authenticator)
 ///      yet cannot drive the account directly and cannot authenticate an 8130 transaction (its `authenticate()` would
-///      call into empty code and fail). Only the account-side authorization (and these examples/tests) ever reference
-///      it; neither the account nor the manager runtime reads it — `executeFor` authorizes purely on
-///      `actorId == bytes20(msg.sender)`, `policy_manager == this`, and a matching binding commitment.
+///      call into empty code and fail). `executeFor` / `executeForMany` require the acting actor's stored
+///      authenticator to equal this sentinel: that restricts the external path to actors the account explicitly
+///      provisioned as external-pull, so a native signing key gated to the same manager cannot be driven through the
+///      auth-less external path. Authorization then also requires `actorId == bytes20(msg.sender)`,
+///      `policy_manager == this`, and a matching binding commitment.
 address constant EXTERNAL_POLICY_AUTHENTICATOR = address(uint160(uint256(keccak256("externalPolicyCaller"))));
 
 /// @title PolicyManager
@@ -28,7 +30,7 @@ address constant EXTERNAL_POLICY_AUTHENTICATOR = address(uint160(uint256(keccak2
 /// @dev Role in the EIP-8130 flow:
 ///      - The manager is registered as an execution-enabled actor on the account (an actor whose authenticator is
 ///        `TRUSTED_EXECUTOR`), so it may drive the account via `executeBatch`.
-///      - A restricted session-key actor is configured with `scope & SCOPE_POLICY != 0` and `policy_manager =
+///      - A restricted session-key actor is configured with `scope & Scopes.POLICY != 0` and `policy_manager =
 ///        address(this)`, so the protocol gate forces every call that actor makes to land on this manager.
 ///      - When the session key transacts, the protocol dispatches its call *as the account*, so `msg.sender`
 ///        here is the account itself. That is the authorization boundary: only a gated session-key transaction
@@ -42,7 +44,7 @@ address constant EXTERNAL_POLICY_AUTHENTICATOR = address(uint160(uint256(keccak2
 ///        itself (`actorId == bytes20(msg.sender)`) and `account` comes from the supplied binding.
 ///
 ///      Commitment binding: the account authorizes a {PolicyBinding}; its `keccak256` is the `commitment`. When the
-///      account authorizes the session-key actor it stores `scope & SCOPE_POLICY != 0`, `policy_manager =
+///      account authorizes the session-key actor it stores `scope & Scopes.POLICY != 0`, `policy_manager =
 ///      address(this)`, and `policy_commitment = commitment` in Keystore. That signed actor change *is*
 ///      the authorization — there is no separate install step and no manager-side install bit. At every execute path
 ///      the manager recomputes the commitment from the supplied binding and requires it to equal the live signed
@@ -95,13 +97,14 @@ contract PolicyManager is ReentrancyGuard {
     error BindingCommitmentMismatch(bytes32 expected, bytes32 actual);
     /// @notice {execute} requires `binding.account == msg.sender` (the protocol-dispatched account).
     error InvalidBindingAccount(address expected, address actual);
-    /// @notice The acting actor has no live policy commitment for the account — i.e. it is not a gated actor of this
-    ///         account, was revoked, or (on the external path) the account did not gate this manager for it.
+    /// @notice The acting actor is a live actor of the account but has no policy binding that routes here — either it
+    ///         is not policy-gated, or (on the external path) the account did not gate this manager for it, or its
+    ///         signed commitment is zero.
     error NoActivePolicy(bytes32 actorId);
-    /// @notice The acting actor's `ActorConfig.expiry` has passed. Commitment is not cleared on expiry (only on
-    ///         revoke), so the manager must enforce this itself on {executeFor} / {executeForMany}, which have no
-    ///         protocol auth path.
-    error ActorExpired(bytes32 actorId);
+    /// @notice The acting actor is not a live external-pull actor of the account: it is unknown, revoked, or expired,
+    ///         or its stored authenticator is not {EXTERNAL_POLICY_AUTHENTICATOR}. Enforced on the external path
+    ///         ({executeFor} / {executeForMany}), which has no protocol auth to reject it first.
+    error InvalidActor(bytes32 actorId);
     /// @notice {executeForMany} array length mismatch between `bindings` and `executionData`.
     error LengthMismatch();
     /// @notice The per-account self-call boundary used by {executeForMany} was invoked by someone other than this
@@ -125,12 +128,13 @@ contract PolicyManager is ReentrancyGuard {
     ///      {PolicyBinding}; recomputing its commitment and comparing to the live signed commitment authenticates
     ///      config, validity window, and owning account in one check.
     ///
-    ///      Actor expiry is not re-checked here: protocol authentication already rejects expired actors before
-    ///      dispatch. `Keystore._authenticate` reverts `ActorExpired`, so a protocol-dispatched call's
-    ///      sender actor was expiry-checked at authentication in the same transaction (same `block.timestamp`, so
-    ///      no gap), and any non-dispatched call yields `actorId == 0` → {NoActivePolicy}. This trades defense-in-depth
-    ///      for one SLOAD; soundness rests on the spec-level invariant that every conforming implementation enforces
-    ///      expiry at authentication. {executeFor} retains a local expiry check because it has no protocol auth.
+    ///      Actor liveness is not re-checked here: protocol authentication already rejects expired (or otherwise
+    ///      non-live) actors before dispatch. `Keystore._authenticate` reverts `ActorExpired`, so a protocol-dispatched
+    ///      call's sender actor was liveness-checked at authentication in the same transaction (same `block.timestamp`,
+    ///      so no gap), and any non-dispatched call yields `actorId == 0` → {NoActivePolicy}. This trades
+    ///      defense-in-depth for one SLOAD; soundness rests on the spec-level invariant that every conforming
+    ///      implementation enforces expiry at authentication. {executeFor} retains a local liveness check
+    ///      ({InvalidActor}) because it has no protocol auth.
     ///
     /// @param binding       Full account-authorized binding (config + window + salt).
     /// @param executionData Per-use action parameters interpreted by the policy.
@@ -154,7 +158,8 @@ contract PolicyManager is ReentrancyGuard {
     ///
     /// @dev The acting identity is the caller itself — `actorId == bytes20(msg.sender)` — and `account` is
     ///      `binding.account`. There is no protocol routing on this path, so unlike {execute} this re-verifies that
-    ///      the account gated *this* manager for the caller and that the actor is unexpired.
+    ///      the caller is a live external-pull actor (authenticator == {EXTERNAL_POLICY_AUTHENTICATOR}) and that the
+    ///      account gated *this* manager for it.
     ///
     /// @param binding       Full account-authorized binding (config + window + salt).
     /// @param executionData Per-use action parameters interpreted by the policy.
@@ -200,7 +205,8 @@ contract PolicyManager is ReentrancyGuard {
         _enforceExternal(binding, actorId, executionData, caller);
     }
 
-    /// @dev External-path validation: manager-match, live commitment vs binding, actor expiry, then enforce.
+    /// @dev External-path validation: live external-pull actor, manager-match, live commitment vs binding, then
+    ///      enforce.
     function _enforceExternal(
         PolicyBinding calldata binding,
         bytes32 actorId,
@@ -208,6 +214,20 @@ contract PolicyManager is ReentrancyGuard {
         address caller
     ) internal {
         address account = binding.account;
+
+        // Liveness + verifier precondition. The external path has no protocol auth (omitted on {execute}, where
+        // authentication already enforced this before dispatch), so the manager itself gates the caller. It requires
+        // the actor to be provisioned with EXTERNAL_POLICY_AUTHENTICATOR — the no-code sentinel that marks an
+        // external-pull actor (one that can act ONLY through this path and can never authenticate a native 8130 tx).
+        // getActorConfig resolves an unknown, revoked, or expired actor to the all-zero config (authenticator 0), so
+        // this single read both enforces liveness AND restricts executeFor to actors the account explicitly opted
+        // into external pull. A native signing key gated to this manager (a real authenticator) is therefore not
+        // drivable through the auth-less external path, where it would bypass protocol replay protection. Checked
+        // before the policy-binding checks so those stay specific to a live external-pull actor.
+        if (KEYSTORE.getActorConfig(account, actorId).authenticator != EXTERNAL_POLICY_AUTHENTICATOR) {
+            revert InvalidActor(actorId);
+        }
+
         if (KEYSTORE.getPolicyManager(account, actorId) != address(this)) {
             revert NoActivePolicy(actorId);
         }
@@ -217,15 +237,7 @@ contract PolicyManager is ReentrancyGuard {
         if (signed == bytes32(0)) revert NoActivePolicy(actorId);
         if (signed != commitment) revert BindingCommitmentMismatch(signed, commitment);
 
-        _requireActiveActor(account, actorId);
         _enforce(binding, commitment, executionData, caller);
-    }
-
-    /// @dev Reject when the acting actor is no longer active. Required on the external path (no protocol auth);
-    ///      omitted on {execute}, where authentication already enforced liveness before dispatch. getActorConfig
-    ///      resolves an expired (or revoked) actor to the all-zero config, so a zero authenticator means "not active".
-    function _requireActiveActor(address account, bytes32 actorId) internal view {
-        if (KEYSTORE.getActorConfig(account, actorId).authenticator == address(0)) revert ActorExpired(actorId);
     }
 
     /// @dev Common enforcement: enforce the binding's validity window (authenticated by the commitment check at the
