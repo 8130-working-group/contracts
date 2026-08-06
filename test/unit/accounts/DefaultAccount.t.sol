@@ -2,8 +2,8 @@
 pragma solidity ^0.8.30;
 
 import {DefaultAccount, Call} from "../../../src/accounts/DefaultAccount.sol";
-import {AccountConfiguration} from "../../../src/AccountConfiguration.sol";
-import {AccountConfigurationTest} from "../../lib/AccountConfigurationTest.sol";
+import {Keystore} from "../../../src/Keystore.sol";
+import {KeystoreTest} from "../../lib/KeystoreTest.sol";
 
 /// @dev Minimal call target: a payable state setter and an unconditional reverter, used to exercise both the
 ///      success and failure legs of the low-level call inside executeBatch.
@@ -19,7 +19,7 @@ contract MockTarget {
     }
 }
 
-contract DefaultAccountTest is AccountConfigurationTest {
+contract DefaultAccountTest is KeystoreTest {
     uint256 constant ACTOR_PK = 100;
 
     // ERC-1271 magic values returned by isValidSignature.
@@ -61,20 +61,18 @@ contract DefaultAccountTest is AccountConfigurationTest {
         address authenticator,
         uint8 scope
     ) internal {
-        AccountConfiguration.ActorChange[] memory changes = new AccountConfiguration.ActorChange[](1);
-        changes[0] = AccountConfiguration.ActorChange({
+        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
+        changes[0] = Keystore.ActorChange({
             actorId: newActorId,
             changeType: 0x01,
-            data: abi.encode(
-                AccountConfiguration.ActorConfig({authenticator: authenticator, scope: scope, expiry: 0}), bytes("")
-            )
+            data: abi.encode(Keystore.ActorConfig({authenticator: authenticator, scope: scope, expiry: 0}), bytes(""))
         });
 
-        uint64 seq = accountConfiguration.getChangeSequences(account).local;
+        uint64 seq = keystore.getChangeSequences(account).local;
         bytes32 digest = _computeActorChangeBatchDigest(account, uint64(block.chainid), seq, changes);
         bytes memory auth = _buildK1Auth(pk, digest);
 
-        accountConfiguration.applySignedActorChanges(account, uint64(block.chainid), changes, auth);
+        keystore.applySignedActorChanges(account, uint64(block.chainid), changes, auth);
     }
 
     // ══════════════════════════════════════════════
@@ -254,6 +252,58 @@ contract DefaultAccountTest is AccountConfigurationTest {
     }
 
     // ══════════════════════════════════════════════
+    //  execute (single call)
+    // ══════════════════════════════════════════════
+
+    /// @notice An unauthorized caller cannot drive execute.
+    /// @dev Exercises the false leg of `_isAuthorizedCaller(msg.sender)`; fuzzes the caller.
+    function test_execute_revert_unauthorizedCaller(address caller) public {
+        (address account,) = _createK1Account(ACTOR_PK);
+        vm.assume(caller != account);
+
+        vm.prank(caller);
+        vm.expectRevert(DefaultAccount.UnauthorizedCaller.selector);
+        DefaultAccount(payable(account)).execute(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+    }
+
+    /// @notice A failing inner call reverts execute.
+    /// @dev Exercises the false leg of the low-level call success check; fuzzes the value carried by the failing call.
+    function test_execute_revert_failedInnerCall(uint256 value) public {
+        (address account,) = _createK1Account(ACTOR_PK);
+        value = bound(value, 0, 1e24);
+        vm.deal(account, value);
+
+        vm.prank(account);
+        vm.expectRevert(DefaultAccount.CallFailed.selector);
+        DefaultAccount(payable(account)).execute(address(target), value, abi.encodeCall(MockTarget.reverting, ()));
+    }
+
+    /// @notice The account calling itself executes a single call.
+    /// @dev Covers the `caller == address(this)` branch and one successful call; fuzzes the stored value.
+    function test_execute_success_selfCaller(uint256 v) public {
+        (address account,) = _createK1Account(ACTOR_PK);
+
+        vm.prank(account);
+        DefaultAccount(payable(account)).execute(address(target), 0, abi.encodeCall(MockTarget.setValue, (v)));
+
+        assertEq(target.value(), v);
+    }
+
+    /// @notice execute forwards ETH value to the target.
+    /// @dev Fuzzes the forwarded amount bounded to the account balance; confirms `call{value:}` wiring.
+    function test_execute_success_withETHValue(uint256 amount) public {
+        (address account,) = _createK1Account(ACTOR_PK);
+        amount = bound(amount, 0, 1e30);
+        vm.deal(account, amount);
+
+        vm.prank(account);
+        DefaultAccount(payable(account)).execute(address(target), amount, abi.encodeCall(MockTarget.setValue, (7)));
+
+        assertEq(address(target).balance, amount);
+        assertEq(target.value(), 7);
+    }
+
+    // ══════════════════════════════════════════════
     //  isValidSignature — failure returns (0xFFFFFFFF)
     // ══════════════════════════════════════════════
 
@@ -313,7 +363,7 @@ contract DefaultAccountTest is AccountConfigurationTest {
         _authorizeActorWithScope(account, ownerPk, bytes32(bytes20(actor)), k1Authenticator, SCOPE_SENDER);
 
         // verifySignature applies the account-scoped EIP-7739 wrap, so sign the replaySafeHash digest.
-        bytes memory authData = _buildK1Auth(actorPk, accountConfiguration.replaySafeHash(account, hash));
+        bytes memory authData = _buildK1Auth(actorPk, keystore.replaySafeHash(account, hash));
 
         bytes4 result = DefaultAccount(payable(account)).isValidSignature(hash, authData);
         assertEq(result, ERC1271_MAGIC);
@@ -347,7 +397,7 @@ contract DefaultAccountTest is AccountConfigurationTest {
         (address account,) = _createK1Account(pk);
 
         // verifySignature applies the account-scoped EIP-7739 wrap, so sign the replaySafeHash digest.
-        bytes memory authData = _buildK1Auth(pk, accountConfiguration.replaySafeHash(account, hash));
+        bytes memory authData = _buildK1Auth(pk, keystore.replaySafeHash(account, hash));
 
         bytes4 result = DefaultAccount(payable(account)).isValidSignature(hash, authData);
         assertEq(result, ERC1271_MAGIC);

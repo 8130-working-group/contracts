@@ -3,13 +3,13 @@ pragma solidity 0.8.36;
 
 import {IAuthenticator} from "./interfaces/IAuthenticator.sol";
 
-/// @notice Account Configuration system contract for EIP-8130.
+/// @notice Keystore system contract for EIP-8130.
 ///         Manages actor authorization, account creation, change sequencing, and account lock. This contract is
-///         also the canonical reference for the EIP-8130 Account Configuration ABI: its public structs, events,
+///         also the canonical reference for the EIP-8130 Keystore ABI: its public structs, events,
 ///         and function signatures are the spec surface, and there is no separate interface file to keep in sync.
 ///
 /// @author Coinbase
-contract AccountConfiguration {
+contract Keystore {
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
     // STRUCTS
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
@@ -436,7 +436,7 @@ contract AccountConfiguration {
         emit AccountCreated(account, userSalt, keccak256(bytecode));
     }
 
-    /// @notice Imports an existing account (which must have bytecode) into AccountConfiguration management via an
+    /// @notice Imports an existing account (which must have bytecode) into Keystore management via an
     ///         ERC-1271 signature over a typed import digest. The implicit default-EOA key is disabled after import.
     ///
     /// @dev Uses a custom (non-EIP-712) digest to partially mitigate eth_signTypedData phishing.
