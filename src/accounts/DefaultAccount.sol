@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Receiver} from "solady/accounts/Receiver.sol";
+import {LibCall} from "solady/utils/LibCall.sol";
 
 import {Keystore} from "../Keystore.sol";
 import {ActorId} from "../libraries/ActorId.sol";
@@ -48,9 +49,6 @@ contract DefaultAccount is Receiver {
     /// @notice The caller is neither the account itself nor a registered TRUSTED_EXECUTOR actor.
     error UnauthorizedCaller();
 
-    /// @notice An inner call in the executed batch reverted.
-    error CallFailed();
-
     /// @notice Deploys the account implementation bound to an Keystore instance.
     /// @param keystore Address of the Keystore system contract.
     constructor(address keystore) {
@@ -64,14 +62,15 @@ contract DefaultAccount is Receiver {
     /// @notice Executes a batch of calls from the account; reverts the entire batch if any call fails.
     ///
     /// @dev Reverts with UnauthorizedCaller when the caller is neither the account nor a TRUSTED_EXECUTOR actor.
-    /// @dev Reverts with CallFailed when any inner call reverts.
+    /// @dev Bubbles up the inner call's revert reason verbatim (a reason-less revert propagates as an empty revert).
     ///
     /// @param calls Ordered calls to execute, each as (target, value, data).
     function executeBatch(Call[] calldata calls) external virtual {
         if (!_isAuthorizedCaller(msg.sender)) revert UnauthorizedCaller();
         for (uint256 i; i < calls.length; i++) {
-            (bool success,) = calls[i].target.call{value: calls[i].value}(calls[i].data);
-            if (!success) revert CallFailed();
+            // Plain `call` (not LibCall.callContract) so value transfers to codeless targets (e.g. EOAs) still succeed.
+            (bool success, bytes memory result) = calls[i].target.call{value: calls[i].value}(calls[i].data);
+            if (!success) LibCall.bubbleUpRevert(result);
         }
     }
 
@@ -81,15 +80,15 @@ contract DefaultAccount is Receiver {
     ///      CoinbaseSmartWallet V1 `execute(address,uint256,bytes)` (0xb61d27f6), so integrations that call that ABI
     ///      directly (e.g. SpendPermissionManager) keep working against this account.
     /// @dev Reverts with UnauthorizedCaller when the caller is neither the account nor a TRUSTED_EXECUTOR actor.
-    /// @dev Reverts with CallFailed when the inner call reverts.
+    /// @dev Bubbles up the inner call's revert reason verbatim (a reason-less revert propagates as an empty revert).
     ///
     /// @param target Address the account calls.
     /// @param value Wei forwarded with the call.
     /// @param data Calldata passed to `target`.
     function execute(address target, uint256 value, bytes calldata data) external virtual {
         if (!_isAuthorizedCaller(msg.sender)) revert UnauthorizedCaller();
-        (bool success,) = target.call{value: value}(data);
-        if (!success) revert CallFailed();
+        (bool success, bytes memory result) = target.call{value: value}(data);
+        if (!success) LibCall.bubbleUpRevert(result);
     }
 
     // ══════════════════════════════════════════════

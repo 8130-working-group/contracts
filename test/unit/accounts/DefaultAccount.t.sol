@@ -5,17 +5,30 @@ import {DefaultAccount, Call} from "../../../src/accounts/DefaultAccount.sol";
 import {Keystore} from "../../../src/Keystore.sol";
 import {KeystoreTest} from "../../lib/KeystoreTest.sol";
 
-/// @dev Minimal call target: a payable state setter and an unconditional reverter, used to exercise both the
-///      success and failure legs of the low-level call inside executeBatch.
+/// @dev Minimal call target: a payable state setter plus reverters that fail with a string reason, a custom error, or
+///      no returndata at all — used to exercise the success and failure legs of the low-level call inside
+///      execute/executeBatch and to verify revert-reason bubbling.
 contract MockTarget {
     uint256 public value;
+
+    /// @dev Custom error used to check that non-string revert reasons bubble up verbatim.
+    error Boom(uint256 code);
 
     function setValue(uint256 v) external payable {
         value = v;
     }
 
-    function reverting() external pure {
+    function reverting() external payable {
         revert("boom");
+    }
+
+    function revertingCustom(uint256 code) external pure {
+        revert Boom(code);
+    }
+
+    /// @dev Reverts with empty returndata; the bubbled revert therefore carries no reason.
+    function revertingSilent() external pure {
+        revert();
     }
 }
 
@@ -99,17 +112,27 @@ contract DefaultAccountTest is KeystoreTest {
             .executeBatch(_singleCall(address(target), 0, abi.encodeCall(MockTarget.setValue, (1))));
     }
 
-    /// @notice A failing inner call aborts the whole batch.
-    /// @dev Exercises the false leg of `require(success)`; fuzzes the ETH value carried by the failing call.
-    function test_executeBatch_revert_failedInnerCall(uint256 value) public {
+    /// @notice A failing inner call aborts the whole batch, bubbling the inner revert reason verbatim.
+    /// @dev Exercises the failure leg of the low-level call; fuzzes the ETH value carried by the failing call.
+    function test_executeBatch_revert_bubblesInnerRevert(uint256 value) public {
         (address account,) = _createK1Account(ACTOR_PK);
         value = bound(value, 0, 1e24);
         vm.deal(account, value);
 
         vm.prank(account);
-        vm.expectRevert(DefaultAccount.CallFailed.selector);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "boom"));
         DefaultAccount(payable(account))
             .executeBatch(_singleCall(address(target), value, abi.encodeCall(MockTarget.reverting, ())));
+    }
+
+    /// @notice A failing inner call with empty returndata bubbles up as a reason-less (empty) revert.
+    function test_executeBatch_revert_emptyReturndataBubblesEmptyRevert() public {
+        (address account,) = _createK1Account(ACTOR_PK);
+
+        vm.prank(account);
+        vm.expectRevert(bytes(""));
+        DefaultAccount(payable(account))
+            .executeBatch(_singleCall(address(target), 0, abi.encodeCall(MockTarget.revertingSilent, ())));
     }
 
     /// @notice A failed call late in the batch rolls back state written by earlier successful calls.
@@ -123,7 +146,7 @@ contract DefaultAccountTest is KeystoreTest {
         calls[1] = Call(address(target), 0, abi.encodeCall(MockTarget.reverting, ()));
 
         vm.prank(account);
-        vm.expectRevert(DefaultAccount.CallFailed.selector);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "boom"));
         DefaultAccount(payable(account)).executeBatch(calls);
 
         assertEq(target.value(), 0);
@@ -306,16 +329,35 @@ contract DefaultAccountTest is KeystoreTest {
         DefaultAccount(payable(account)).execute(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
     }
 
-    /// @notice A failing inner call reverts execute.
-    /// @dev Exercises the false leg of the low-level call success check; fuzzes the value carried by the failing call.
-    function test_execute_revert_failedInnerCall(uint256 value) public {
+    /// @notice A failing inner call reverts execute, bubbling the inner Error(string) reason verbatim.
+    /// @dev Exercises the failure leg of the low-level call; fuzzes the value carried by the failing call.
+    function test_execute_revert_bubblesInnerRevert(uint256 value) public {
         (address account,) = _createK1Account(ACTOR_PK);
         value = bound(value, 0, 1e24);
         vm.deal(account, value);
 
         vm.prank(account);
-        vm.expectRevert(DefaultAccount.CallFailed.selector);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "boom"));
         DefaultAccount(payable(account)).execute(address(target), value, abi.encodeCall(MockTarget.reverting, ()));
+    }
+
+    /// @notice execute bubbles a non-string (custom error) revert reason verbatim.
+    /// @dev Confirms the bubble-up helper re-throws arbitrary returndata, not just Error(string); fuzzes the code.
+    function test_execute_revert_bubblesCustomError(uint256 code) public {
+        (address account,) = _createK1Account(ACTOR_PK);
+
+        vm.prank(account);
+        vm.expectRevert(abi.encodeWithSelector(MockTarget.Boom.selector, code));
+        DefaultAccount(payable(account)).execute(address(target), 0, abi.encodeCall(MockTarget.revertingCustom, (code)));
+    }
+
+    /// @notice A failing inner call with empty returndata bubbles up as a reason-less (empty) revert.
+    function test_execute_revert_emptyReturndataBubblesEmptyRevert() public {
+        (address account,) = _createK1Account(ACTOR_PK);
+
+        vm.prank(account);
+        vm.expectRevert(bytes(""));
+        DefaultAccount(payable(account)).execute(address(target), 0, abi.encodeCall(MockTarget.revertingSilent, ()));
     }
 
     /// @notice The account calling itself executes a single call.
