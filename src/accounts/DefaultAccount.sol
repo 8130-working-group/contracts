@@ -46,6 +46,12 @@ contract DefaultAccount is Receiver {
     /// @notice The Keystore system contract that owns this account's authorization state.
     Keystore public immutable KEYSTORE;
 
+    /// @notice ERC-1271 magic value returned for a valid signature: bytes4(keccak256("isValidSignature(bytes32,bytes)")).
+    bytes4 internal constant ERC1271_MAGIC_VALUE = 0x1626ba7e;
+
+    /// @notice ERC-1271 sentinel returned for an invalid signature.
+    bytes4 internal constant ERC1271_INVALID = 0xffffffff;
+
     /// @notice The caller is neither the account itself nor a registered TRUSTED_EXECUTOR actor.
     error UnauthorizedCaller();
 
@@ -95,15 +101,24 @@ contract DefaultAccount is Receiver {
     //  ERC-1271
     // ══════════════════════════════════════════════
 
-    /// @notice Validates an ERC-1271 signature via Keystore; requires the verified actor to be
-    ///         operational (the unrestricted admin, scope == 0x00, or a SENDER actor without POLICY). Never reverts.
+    /// @notice Validates an ERC-1271 signature via Keystore; requires the verified actor to be operational (the
+    ///         unrestricted admin, scope == 0x00, or a SENDER actor without POLICY). Never reverts.
+    ///
+    /// @dev {Keystore.validateSignature} resolves the typed envelope and reverts on any authentication failure; the
+    ///      revert is caught and reported as the ERC-1271 failure value. Operational gating lives here (not in the
+    ///      Keystore): signing is authorized for any operational actor via {Scopes.isOperator}, keeping the signing
+    ///      and execution ({_isAuthorizedCaller}) authorization surfaces aligned.
     ///
     /// @param hash The digest to authenticate.
-    /// @param signature Auth data in `authenticator || data` format.
+    /// @param signature Envelope in `sigType(1) || authenticator(20) || data` format.
     ///
-    /// @return The ERC-1271 magic value 0x1626ba7e if valid, otherwise 0xffffffff.
+    /// @return The ERC-1271 magic value (ERC1271_MAGIC_VALUE) if valid, otherwise ERC1271_INVALID.
     function isValidSignature(bytes32 hash, bytes calldata signature) external view virtual returns (bytes4) {
-        return KEYSTORE.verifySignature(address(this), hash, signature) ? bytes4(0x1626ba7e) : bytes4(0xFFFFFFFF);
+        try KEYSTORE.validateSignature(address(this), hash, signature) returns (bytes32, uint16 scope) {
+            return Scopes.isOperator(scope) ? ERC1271_MAGIC_VALUE : ERC1271_INVALID;
+        } catch {
+            return ERC1271_INVALID;
+        }
     }
 
     // ══════════════════════════════════════════════

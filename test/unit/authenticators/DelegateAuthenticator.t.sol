@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import {Keystore} from "../../../src/Keystore.sol";
 import {DelegateAuthenticator} from "../../../src/authenticators/DelegateAuthenticator.sol";
+import {DefaultAccount} from "../../../src/accounts/DefaultAccount.sol";
 import {KeystoreTest} from "../../lib/KeystoreTest.sol";
 
 /// @notice Fuzzed, branch-complete test suite for DelegateAuthenticator.authenticate.
@@ -15,9 +16,10 @@ import {KeystoreTest} from "../../lib/KeystoreTest.sol";
 ///         On success returns actorId = bytes32(uint256(uint160(delegate))).
 ///
 ///         The delegate vouch requires the nested auth to resolve to the ADMIN actor on `delegate` (scope ==
-///         0x00). This admin-only requirement is enforced independently of verifySignature (via authenticateActor
-///         + an explicit scope == 0 check): verifySignature is now operational (a SENDER-without-POLICY key can
-///         sign), but such a key must NOT be able to vouch as a delegate, so a non-admin nested actor reverts.
+///         0x00). This admin-only requirement is enforced independently of the account's ERC-1271 check (via
+///         authenticateActor + an explicit scope == 0 check): a SENDER-without-POLICY key can produce a valid
+///         ERC-1271 signature, but such a key must NOT be able to vouch as a delegate, so a non-admin nested
+///         actor reverts.
 contract DelegateAuthenticatorTest is KeystoreTest {
     uint16 constant SCOPE_SENDER = 0x01;
     uint16 constant SCOPE_POLICY = 0x02;
@@ -124,8 +126,8 @@ contract DelegateAuthenticatorTest is KeystoreTest {
     }
 
     /// @dev Regression guard for the operational/admin decoupling: a SENDER-without-POLICY nested actor on the
-    ///      delegate account CAN verifySignature (it is operational), yet it MUST NOT satisfy the delegate vouch,
-    ///      which stays admin-only. Asserts verifySignature is true for the same actor, then that the vouch reverts.
+    ///      delegate account CAN satisfy the account's ERC-1271 (it is operational), yet it MUST NOT satisfy the
+    ///      delegate vouch, which stays admin-only. Asserts ERC-1271 validates for the actor, then the vouch reverts.
     function test_authenticate_revert_operationalSenderCannotVouch(uint256 ownerSeed, uint256 signerSeed, bytes32 hash)
         public
     {
@@ -139,10 +141,11 @@ contract DelegateAuthenticatorTest is KeystoreTest {
 
         bytes memory nestedAuth = abi.encodePacked(k1Authenticator, _signDigest(signerPk, hash));
 
-        // verifySignature wraps: sign replaySafeHash. (nestedAuth, over the raw hash, is for the vouch below.)
+        // The account's ERC-1271 accepts a local envelope over replaySafeHash. (nestedAuth, over the raw hash, is
+        // for the vouch below.)
         bytes memory wrappedAuth =
-            abi.encodePacked(k1Authenticator, _signDigest(signerPk, keystore.replaySafeHash(delegateAccount, hash)));
-        assertTrue(keystore.verifySignature(delegateAccount, hash, wrappedAuth));
+            _wrapLocal(_buildK1Auth(signerPk, keystore.replaySafeHash(delegateAccount, block.chainid, hash)));
+        assertEq(DefaultAccount(payable(delegateAccount)).isValidSignature(hash, wrappedAuth), bytes4(0x1626ba7e));
 
         // But it cannot vouch as a delegate — the nested check stays admin-only.
         bytes memory data = abi.encodePacked(delegateAccount, nestedAuth);
@@ -165,9 +168,9 @@ contract DelegateAuthenticatorTest is KeystoreTest {
         assertEq(actorId, bytes32(uint256(uint160(delegateAccount))));
     }
 
-    /// @dev The former SIGNER bit (0x10, now SCOPE_SPONSOR_PAYER) no longer grants signing: a nested actor holding
-    ///      it is non-admin (and non-operational), so the delegate vouch reverts.
-    function test_authenticate_revert_formerSignerBitCannotSign(uint256 ownerSeed, uint256 signerSeed, bytes32 hash)
+    /// @dev The SCOPE_SPONSOR_PAYER bit (0x10) does not grant signing: a nested actor holding only it is non-admin
+    ///      (and cannot produce a valid ERC-1271 signature), so the delegate vouch reverts.
+    function test_authenticate_revert_sponsorPayerBitCannotSign(uint256 ownerSeed, uint256 signerSeed, bytes32 hash)
         public
     {
         uint256 ownerPk = _boundK1Pk(ownerSeed);
