@@ -5,17 +5,24 @@ import {Keystore} from "../../../src/Keystore.sol";
 import {Scopes} from "../../../src/libraries/Scopes.sol";
 import {KeystoreTest} from "../../lib/KeystoreTest.sol";
 
-/// @notice Branch-complete, fuzz-by-default suite for the account lock surface: applySignedLockChanges (op = lock /
-///         unlock), isLocked, getLockStatus, the onlyUnlocked modifier and _checkAndClearLock. Lock state changes
-///         ONLY through applySignedLockChanges — a relayable, admin-authorized (scope 0) signed call — so lock-side
-///         tests use a controllable key: an uninitialized EOA at vm.addr(pk) signs with its inline default-EOA self
-///         (scope 0 admin), and anyone (here the test) relays. Tests that must drive an onlyUnlocked-guarded config
-///         path (applySignedActorChanges) create a real k1 account so the authenticated actor can change actors.
-contract AccountLockTest is KeystoreTest {
-    // ── Local fuzz-bound helpers ──
+/// @notice §10 test matrix for the account-environment surface driven through {applySignedAccountChanges}: the lock
+///         / unlock ops (admin-authorized), the Multichain channel (no epochs, no unsequenced mode), and the
+///         split-layout regression checks.
+contract AccountEnvironmentTest is KeystoreTest {
+    bytes32 constant ACTOR_A = bytes32(uint256(0xA1));
+    bytes32 constant ACTOR_B = bytes32(uint256(0xB2));
 
-    /// @dev Keep a fuzzed account out of the zero address, the system contract, and the forge-std cheatcode /
-    ///      console addresses so it acts as a clean, code-free account.
+    uint16 constant SENDER = Scopes.SENDER;
+
+    function setUp() public override {
+        super.setUp();
+        vm.warp(1_000_000);
+    }
+
+    function _future(uint48 delta) internal view returns (uint48) {
+        return uint48(block.timestamp + delta);
+    }
+
     function _assumeSafeAccount(address account) internal view {
         vm.assume(account != address(0));
         vm.assume(account != address(keystore));
@@ -23,227 +30,12 @@ contract AccountLockTest is KeystoreTest {
         vm.assume(account != CONSOLE);
     }
 
-    /// @dev A single authorize-actor change granting an unrestricted k1 owner (scope 0, no expiry, no policy).
-    function _oneAuthorizeChange(bytes32 actorId) internal view returns (Keystore.ActorChange[] memory changes) {
-        changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({
-            changeType: Keystore.ActorChangeType.Authorize,
-            actorId: actorId,
-            data: abi.encode(
-                Keystore.ActorConfig({authenticator: address(k1Authenticator), scope: 0x00, expiry: 0}), bytes("")
-            )
-        });
-    }
-
-    /// @dev Authorize a k1 actor (actorId = bytes32(bytes20(newSigner))) with `scope` on `account`, signed by the
-    ///      account's admin owner `ownerPk`.
-    function _authorizeK1ActorWithScope(address account, uint256 ownerPk, address newSigner, uint16 scope) internal {
-        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({
-            changeType: Keystore.ActorChangeType.Authorize,
-            actorId: bytes32(bytes20(newSigner)),
-            data: abi.encode(
-                Keystore.ActorConfig({authenticator: address(k1Authenticator), scope: scope, expiry: 0}), bytes("")
-            )
-        });
-        uint64 chainId = uint64(block.chainid);
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, chainId, seq, changes);
-        bytes memory auth = _buildK1Auth(ownerPk, digest);
-        keystore.applySignedActorChanges(account, chainId, changes, auth);
-    }
-
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-    // REVERTS (source order: authorization -> lock op -> unlock op -> onlyUnlocked on other functions)
+    // LOCK / UNLOCK
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice applySignedLockChanges reverts UnauthorizedLockChange when the signer is a scoped (non-admin) actor.
-    /// @dev The owner authorizes a SCOPE_SENDER k1 actor, which then signs a lock op; scope != 0 is rejected after
-    ///      authentication, before any lock-state work.
-    function test_applySignedLockChanges_revert_whenSignerNotAdmin(uint256 ownerSeed, uint256 scopedSeed, uint16 delay)
-        public
-    {
-        uint256 ownerPk = _boundK1Pk(ownerSeed);
-        uint256 scopedPk = _boundK1Pk(scopedSeed);
-        vm.assume(vm.addr(ownerPk) != vm.addr(scopedPk));
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        (address account,) = _createK1Account(ownerPk);
-        address scopedSigner = vm.addr(scopedPk);
-        vm.assume(scopedSigner != account);
-
-        _authorizeK1ActorWithScope(account, ownerPk, scopedSigner, Scopes.SENDER);
-
-        bytes memory auth = _lockAuth(scopedPk, account, delay);
-        vm.expectRevert(Keystore.UnauthorizedLockChange.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, delay, auth);
-    }
-
-    /// @notice applySignedLockChanges reverts UnknownLockChangeType for LockChangeType.Invalid (0) — the only unrecognized op value
-    ///         that reaches the handler. Out-of-range wire values (>= 3) never get here; they panic at ABI-decode
-    ///         (see test_applySignedLockChanges_revert_outOfRangeOpPanics).
-    function test_applySignedLockChanges_revert_invalidOp(uint256 pkSeed, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest =
-            _computeLockChangeDigest(account, block.chainid, uint8(Keystore.LockChangeType.Invalid), delay, seq);
-        bytes memory auth = _buildK1Auth(pk, digest);
-
-        vm.expectRevert(Keystore.UnknownLockChangeType.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Invalid, delay, auth);
-    }
-
-    /// @notice An out-of-range op wire value (>= 3, not a declared LockChangeType member) is rejected by the ABI decoder
-    ///         before the handler runs — the enum can only decode to a declared member. This is what makes Invalid (0)
-    ///         the sole reachable "unrecognized" case. Uses a low-level call so the raw wire byte survives to the
-    ///         decoder (the typed entry point cannot express an out-of-range value). Solidity's calldata enum-decode
-    ///         check reverts with empty returndata (distinct from an in-body enum conversion, which panics 0x21).
-    function test_applySignedLockChanges_revert_outOfRangeOp(uint256 pkSeed, uint8 op, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        op = uint8(bound(op, 3, type(uint8).max));
-
-        // Decode reverts before the body, so auth is irrelevant. op is ABI-encoded as the enum's uint8 slot.
-        bytes memory cd =
-            abi.encodeWithSelector(Keystore.applySignedLockChanges.selector, account, op, delay, bytes(""));
-        (bool ok, bytes memory ret) = address(keystore).call(cd);
-
-        assertFalse(ok);
-        assertEq(ret.length, 0); // enum decode rejects the out-of-range op with an empty revert
-    }
-
-    /// @notice A lock op (op = 1) with a zero unlock delay reverts ZeroUnlockDelay.
-    /// @dev Exercises the `unlockDelay == 0` guard on the lock branch; the unlocked-state check passes (fresh account).
-    function test_lock_revert_zeroUnlockDelay(uint256 pkSeed) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-
-        bytes memory auth = _lockAuth(pk, account, 0);
-        vm.expectRevert(Keystore.ZeroUnlockDelay.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, 0, auth);
-    }
-
-    /// @notice A lock op reverts AccountIsLocked when the account is already hard-locked.
-    /// @dev Second lock hits _checkAndClearLock with FLAG_LOCKED set and FLAG_UNLOCK_INITIATED clear (hard-locked branch).
-    function test_lock_revert_whenAlreadyHardLocked(uint256 pkSeed, uint16 firstDelay, uint16 secondDelay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        firstDelay = uint16(bound(firstDelay, 1, type(uint16).max));
-        secondDelay = uint16(bound(secondDelay, 1, type(uint16).max));
-
-        _signedLock(pk, account, firstDelay);
-
-        bytes memory auth = _lockAuth(pk, account, secondDelay);
-        vm.expectRevert(Keystore.AccountIsLocked.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, secondDelay, auth);
-    }
-
-    /// @notice An unlock op (op = 2) with a non-zero unlock delay reverts InvalidUnlockDelay.
-    /// @dev The delay guard fires before the hard-locked-state check, so it trips even on a fresh account.
-    function test_unlock_revert_nonZeroUnlockDelay(uint256 pkSeed, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeLockChangeDigest(account, block.chainid, UNLOCK_OP, delay, seq);
-        bytes memory auth = _buildK1Auth(pk, digest);
-
-        vm.expectRevert(Keystore.InvalidUnlockDelay.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Unlock, delay, auth);
-    }
-
-    /// @notice An unlock op reverts NotLocked when the account has never been locked (FLAG_LOCKED clear).
-    function test_initiateUnlock_revert_whenNeverLocked(uint256 pkSeed) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-
-        bytes memory auth = _unlockAuth(pk, account);
-        vm.expectRevert(Keystore.NotLocked.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Unlock, 0, auth);
-    }
-
-    /// @notice An unlock op reverts NotLocked once an unlock has already been initiated.
-    /// @dev After the first unlock, FLAG_UNLOCK_INITIATED is set, so a second unlock reverts.
-    function test_initiateUnlock_revert_whenUnlockAlreadyInitiated(uint256 pkSeed, uint16 delay, uint256 t0) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-
-        _signedLock(pk, account, delay);
-        vm.warp(t0);
-        _signedUnlock(pk, account);
-
-        bytes memory auth = _unlockAuth(pk, account);
-        vm.expectRevert(Keystore.NotLocked.selector);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Unlock, 0, auth);
-    }
-
-    /// @notice A replayed lock auth fails: the local sequence advanced on the first success, so the signed digest no
-    ///         longer matches and authentication fails.
-    function test_applySignedLockChanges_revert_whenAuthReplayed(uint256 pkSeed, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-
-        bytes memory auth = _lockAuth(pk, account, delay); // signed over sequence 0
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, delay, auth); // sequence 0 -> 1
-
-        vm.expectRevert();
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, delay, auth);
-    }
-
-    /// @notice A lock auth signed over a sequence other than the account's current one fails to authenticate.
-    function test_applySignedLockChanges_revert_whenSequenceWrong(uint256 pkSeed, uint16 delay, uint64 seqOffset)
-        public
-    {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        seqOffset = uint64(bound(seqOffset, 1, type(uint64).max - 1));
-
-        uint64 wrongSeq = keystore.getChangeSequences(account).local + seqOffset;
-        bytes32 digest = _computeLockChangeDigest(account, block.chainid, LOCK_OP, delay, wrongSeq);
-        bytes memory auth = _buildK1Auth(pk, digest);
-
-        vm.expectRevert();
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, delay, auth);
-    }
-
-    /// @notice applySignedActorChanges reverts AccountIsLocked while the target account is hard-locked.
-    /// @dev Exercises the onlyUnlocked modifier on a config-mutating path; the guard fires before any auth work.
-    function test_applySignedActorChanges_revert_whenLocked(uint256 pkSeed, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        (address account,) = _createK1Account(pk);
-
-        _signedLock(pk, account, delay);
-
-        Keystore.ActorChange[] memory changes = _oneAuthorizeChange(bytes32(bytes20(vm.addr(pk))));
-        uint64 chainId = uint64(block.chainid);
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, chainId, seq, changes);
-        bytes memory auth = _buildK1Auth(pk, digest);
-
-        vm.expectRevert(Keystore.AccountIsLocked.selector);
-        keystore.applySignedActorChanges(account, chainId, changes, auth);
-    }
-
-    /// @notice importAccount reverts AccountIsLocked while the target account is hard-locked.
-    /// @dev The onlyUnlocked(account) modifier runs before the import body, so the lock guard is asserted in
-    ///      isolation on a second, distinct function (empty initialActors never reached).
-    function test_importAccount_revert_whenLocked(uint256 pkSeed, uint16 delay) public {
+    /// @notice A lock op hard-locks the account (delay stored, isLocked true, max-sentinel unlocksAt).
+    function test_lock_success_setsHardLock(uint256 pkSeed, uint16 delay) public {
         uint256 pk = _boundK1Pk(pkSeed);
         address account = vm.addr(pk);
         _assumeSafeAccount(account);
@@ -251,289 +43,460 @@ contract AccountLockTest is KeystoreTest {
 
         _signedLock(pk, account, delay);
 
-        Keystore.InitialActor[] memory actors = new Keystore.InitialActor[](0);
-        vm.expectRevert(Keystore.AccountIsLocked.selector);
-        keystore.importAccount(account, block.chainid, actors, "");
-    }
-
-    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-    // HAPPY PATHS / BRANCH COVERAGE
-    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
-
-    /// @notice A lock op hard-locks the account: FLAG_LOCKED set, delay stored in lockUnion.
-    /// @dev getLockStatus reports locked, not-yet-initiated, the synthesized max sentinel for unlocksAt and the stored
-    ///      delay; isLocked true.
-    function test_lock_success_setsHardLockStatus(uint256 pkSeed, uint16 delay) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-
-        _signedLock(pk, account, delay);
-
-        (bool locked, bool hasInitiatedUnlock, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
+        (bool locked, bool init, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
         assertTrue(locked);
-        assertFalse(hasInitiatedUnlock);
+        assertFalse(init);
         assertEq(unlocksAt, type(uint48).max);
         assertEq(storedDelay, delay);
         assertTrue(keystore.isLocked(account));
     }
 
-    /// @notice A lock op emits AccountLocked(account, unlockDelay) exactly once. Sole assertion of this event.
+    /// @notice A lock op emits AccountLocked(account, delay).
     function test_lock_success_emitsAccountLocked(uint256 pkSeed, uint16 delay) public {
         uint256 pk = _boundK1Pk(pkSeed);
         address account = vm.addr(pk);
         _assumeSafeAccount(account);
         delay = uint16(bound(delay, 1, type(uint16).max));
 
-        bytes memory auth = _lockAuth(pk, account, delay);
         vm.expectEmit(true, false, false, true, address(keystore));
         emit Keystore.AccountLocked(account, delay);
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Lock, delay, auth);
+        _signedLock(pk, account, delay);
     }
 
-    /// @notice An account can be re-locked after a prior unlock delay has fully elapsed.
-    /// @dev Drives _checkAndClearLock through its lazy-clear branch (UNLOCK_INITIATED set, block.timestamp >= stored unlocksAt):
-    ///      the stale timestamp is cleared to 0 and the fresh lock succeeds, hard-locking again with the new delay.
-    function test_lock_success_relockAfterUnlockExpired(
-        uint256 pkSeed,
-        uint16 firstDelay,
-        uint16 secondDelay,
-        uint256 t0,
-        uint256 extra
-    ) public {
+    /// @notice A lock op with a zero unlock delay reverts ZeroUnlockDelay.
+    function test_lock_revert_zeroDelay(uint256 pkSeed) public {
         uint256 pk = _boundK1Pk(pkSeed);
         address account = vm.addr(pk);
         _assumeSafeAccount(account);
-        firstDelay = uint16(bound(firstDelay, 1, type(uint16).max));
-        secondDelay = uint16(bound(secondDelay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-        extra = bound(extra, 0, 1e9);
 
-        _signedLock(pk, account, firstDelay);
-        vm.warp(t0);
-        _signedUnlock(pk, account);
-
-        vm.warp(t0 + firstDelay + extra); // at or past unlocksAt: account is unlocked
-        assertFalse(keystore.isLocked(account));
-
-        _signedLock(pk, account, secondDelay);
-
-        (bool locked, bool hasInitiatedUnlock, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
-        assertTrue(locked);
-        assertFalse(hasInitiatedUnlock);
-        assertEq(unlocksAt, type(uint48).max);
-        assertEq(storedDelay, secondDelay);
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, _one(_lockChange(0)));
+        vm.expectRevert(Keystore.ZeroUnlockDelay.selector);
+        keystore.applySignedAccountChanges(account, s);
     }
 
-    /// @notice An unlock op sets unlocksAt = block.timestamp + delay and zeroes the stored delay.
-    /// @dev Before the delay elapses the account is still locked but now reports hasInitiatedUnlock; unlockDelay is 0.
-    function test_initiateUnlock_success_setsUnlocksAtAndClearsDelay(uint256 pkSeed, uint16 delay, uint256 t0) public {
+    /// @notice A second lock while already hard-locked reverts AccountIsLocked.
+    function test_lock_revert_whenAlreadyLocked(uint256 pkSeed, uint16 d1, uint16 d2) public {
+        uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+        d1 = uint16(bound(d1, 1, type(uint16).max));
+        d2 = uint16(bound(d2, 1, type(uint16).max));
+
+        _signedLock(pk, account, d1);
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, _one(_lockChange(d2)));
+        vm.expectRevert(Keystore.AccountIsLocked.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice `[Lock, Unlock, Lock]` reverts LockChangeMustBeStandalone: the standalone rule rejects the multi-op
+    ///         batch on its first (Lock) change, so the earlier lock/unlock desync scenario is now structurally
+    ///         impossible (a lock transition can never interleave with another change in one batch).
+    function test_lock_revert_lockUnlockLockSameBatch(uint256 pkSeed, uint16 d1, uint16 d2) public {
+        uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+        d1 = uint16(bound(d1, 1, type(uint16).max));
+        d2 = uint16(bound(d2, 1, type(uint16).max));
+
+        Keystore.AccountChange[] memory ch = new Keystore.AccountChange[](3);
+        ch[0] = _lockChange(d1);
+        ch[1] = _unlockChange();
+        ch[2] = _lockChange(d2);
+
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, ch);
+        vm.expectRevert(Keystore.LockChangeMustBeStandalone.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice An unlock on a never-locked account reverts NotLocked.
+    function test_unlock_revert_whenNeverLocked(uint256 pkSeed) public {
+        uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, _one(_unlockChange()));
+        vm.expectRevert(Keystore.NotLocked.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice An unlock op sets unlocksAt = now + delay, zeroes the stored delay, emits AccountUnlockInitiated.
+    function test_unlock_success_initiates(uint256 pkSeed, uint16 delay, uint256 t0) public {
         uint256 pk = _boundK1Pk(pkSeed);
         address account = vm.addr(pk);
         _assumeSafeAccount(account);
         delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-
-        _signedLock(pk, account, delay);
-        vm.warp(t0);
-        _signedUnlock(pk, account);
-
-        (bool locked, bool hasInitiatedUnlock, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
-        assertTrue(locked); // block.timestamp (t0) < unlocksAt (t0 + delay)
-        assertTrue(hasInitiatedUnlock);
-        assertEq(unlocksAt, uint48(t0 + delay));
-        assertEq(storedDelay, 0);
-        assertTrue(keystore.isLocked(account));
-    }
-
-    /// @notice An unlock op emits AccountUnlockInitiated(account, unlocksAt) exactly once. Sole assertion.
-    function test_initiateUnlock_success_emitsAccountUnlockInitiated(uint256 pkSeed, uint16 delay, uint256 t0) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
+        t0 = bound(t0, block.timestamp, 1e12);
 
         _signedLock(pk, account, delay);
         vm.warp(t0);
 
-        bytes memory auth = _unlockAuth(pk, account);
         vm.expectEmit(true, false, false, true, address(keystore));
         emit Keystore.AccountUnlockInitiated(account, uint48(t0 + delay));
-        keystore.applySignedLockChanges(account, Keystore.LockChangeType.Unlock, 0, auth);
-    }
-
-    /// @notice isLocked is false for an account that has never been locked (FLAG_LOCKED clear).
-    function test_isLocked_success_falseWhenNeverLocked(address account, uint256 ts) public {
-        _assumeSafeAccount(account);
-        vm.warp(bound(ts, 1, 1e12));
-        assertFalse(keystore.isLocked(account));
-    }
-
-    /// @notice isLocked stays true for a hard-locked account at any timestamp (FLAG_LOCKED set, no pending unlock —
-    ///         hard-lock is timestamp-independent).
-    function test_isLocked_success_trueWhileHardLocked(uint256 pkSeed, uint16 delay, uint256 ts) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-
-        _signedLock(pk, account, delay);
-
-        vm.warp(bound(ts, 1, 1e12)); // hard-lock ignores the clock: FLAG_LOCKED set with no pending unlock
-        assertTrue(keystore.isLocked(account));
-    }
-
-    /// @notice isLocked remains true after an unlock is initiated while block.timestamp is strictly before unlocksAt.
-    function test_isLocked_success_trueBeforeUnlockDelayElapses(
-        uint256 pkSeed,
-        uint16 delay,
-        uint256 t0,
-        uint256 within
-    ) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-
-        _signedLock(pk, account, delay);
-        vm.warp(t0);
         _signedUnlock(pk, account);
 
-        vm.warp(bound(within, t0, t0 + delay - 1)); // strictly before unlocksAt == t0 + delay
-        assertTrue(keystore.isLocked(account));
-    }
-
-    /// @notice isLocked flips to false once block.timestamp reaches or passes unlocksAt after an initiated unlock.
-    /// @dev Includes the exact boundary (extra == 0): isLocked is `block.timestamp < unlocksAt`, so == is unlocked.
-    function test_isLocked_success_falseAfterUnlockDelayElapses(uint256 pkSeed, uint16 delay, uint256 t0, uint256 extra)
-        public
-    {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-        extra = bound(extra, 0, 1e9);
-
-        _signedLock(pk, account, delay);
-        vm.warp(t0);
-        _signedUnlock(pk, account);
-
-        vm.warp(t0 + delay + extra); // at or past unlocksAt
-        assertFalse(keystore.isLocked(account));
-    }
-
-    /// @notice getLockStatus reports all-clear for a never-locked account: unlocked, not initiated, zeroed fields.
-    function test_getLockStatus_success_whenNeverLocked(address account) public view {
-        (bool locked, bool hasInitiatedUnlock, uint48 unlocksAt, uint16 unlockDelay) = keystore.getLockStatus(account);
-        assertFalse(locked);
-        assertFalse(hasInitiatedUnlock);
-        assertEq(unlocksAt, 0);
-        assertEq(unlockDelay, 0);
-    }
-
-    /// @notice getLockStatus reports a clean unlocked state once an initiated unlock has elapsed, even with no
-    ///         intervening onlyUnlocked call to clear storage.
-    /// @dev getLockStatus never runs _checkAndClearLock, but it applies the elapse itself: once block.timestamp
-    ///      reaches unlocksAt it returns (false, false, 0, 0) — matching _checkAndClearLock's post-clear result —
-    ///      rather than surfacing the stale initiated-unlock fields still sitting in storage.
-    function test_getLockStatus_success_afterUnlockElapsedReportsUnlocked(
-        uint256 pkSeed,
-        uint16 delay,
-        uint256 t0,
-        uint256 extra
-    ) public {
-        uint256 pk = _boundK1Pk(pkSeed);
-        address account = vm.addr(pk);
-        _assumeSafeAccount(account);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-        extra = bound(extra, 0, 1e9);
-
-        _signedLock(pk, account, delay);
-        vm.warp(t0);
-        _signedUnlock(pk, account);
-
-        vm.warp(t0 + delay + extra); // at or past unlocksAt, but no onlyUnlocked call to clear storage
-
-        (bool locked, bool hasInitiatedUnlock, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
-        assertFalse(locked);
-        assertFalse(hasInitiatedUnlock);
-        assertEq(unlocksAt, 0);
+        (bool locked, bool init, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
+        assertTrue(locked);
+        assertTrue(init);
+        assertEq(unlocksAt, uint48(t0 + delay));
         assertEq(storedDelay, 0);
     }
 
-    /// @notice Full lock -> initiate-unlock -> warp-past -> config change cycle: once the delay elapses,
-    ///         _checkAndClearLock lets an onlyUnlocked config change through and the new actor is authorized.
-    /// @dev Drives the expiry-clear branch of _checkAndClearLock on the real applySignedActorChanges path.
-    function test_applySignedActorChanges_success_afterFullUnlockCycle(
-        uint256 pkSeed,
-        uint256 newActorSeed,
-        uint16 delay,
-        uint256 t0,
-        uint256 extra
-    ) public {
+    /// @notice A second unlock after one was already initiated reverts NotLocked.
+    function test_unlock_revert_whenAlreadyInitiated(uint256 pkSeed, uint16 delay, uint256 t0) public {
         uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
         delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
-        extra = bound(extra, 0, 1e9);
-        (address account,) = _createK1Account(pk);
-
-        address newActor = address(uint160(bound(newActorSeed, 1, type(uint160).max)));
-        vm.assume(newActor != account);
-        vm.assume(newActor != vm.addr(pk));
-        bytes32 newActorId = bytes32(bytes20(newActor));
+        t0 = bound(t0, block.timestamp, 1e9);
 
         _signedLock(pk, account, delay);
         vm.warp(t0);
         _signedUnlock(pk, account);
-        vm.warp(t0 + delay + extra); // at or past unlocksAt: unlocked
-        assertFalse(keystore.isLocked(account));
 
-        Keystore.ActorChange[] memory changes = _oneAuthorizeChange(newActorId);
-        uint64 chainId = uint64(block.chainid);
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, chainId, seq, changes);
-        bytes memory auth = _buildK1Auth(pk, digest);
-
-        keystore.applySignedActorChanges(account, chainId, changes, auth);
-
-        assertTrue(_isActor(account, newActorId));
-        // The onlyUnlocked prelude cleared the stale unlock timestamp back to 0.
-        (,, uint48 unlocksAt,) = keystore.getLockStatus(account);
-        assertEq(unlocksAt, 0);
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, _one(_unlockChange()));
+        vm.expectRevert(Keystore.NotLocked.selector);
+        keystore.applySignedAccountChanges(account, s);
     }
 
-    /// @notice applySignedActorChanges still reverts AccountIsLocked after an unlock is initiated but before its delay
-    ///         elapses: config stays frozen for the whole notice window, not just while hard-locked.
-    /// @dev Drives the pending-unlock branch of _checkAndClearLock (FLAG_UNLOCK_INITIATED set, block.timestamp <
-    ///      stored unlocksAt) on the real onlyUnlocked-guarded config path — distinct from the hard-locked branch.
-    function test_applySignedActorChanges_revert_whileUnlockPending(
-        uint256 pkSeed,
-        uint16 delay,
-        uint256 t0,
-        uint256 within
-    ) public {
+    /// @notice An account can be re-locked once a prior unlock delay has fully elapsed.
+    function test_lock_success_relockAfterUnlockElapsed(uint256 pkSeed, uint16 d1, uint16 d2, uint256 t0) public {
         uint256 pk = _boundK1Pk(pkSeed);
-        delay = uint16(bound(delay, 1, type(uint16).max));
-        t0 = bound(t0, 1, 1e9);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+        d1 = uint16(bound(d1, 1, type(uint16).max));
+        d2 = uint16(bound(d2, 1, type(uint16).max));
+        t0 = bound(t0, block.timestamp, 1e9);
+
+        _signedLock(pk, account, d1);
+        vm.warp(t0);
+        _signedUnlock(pk, account);
+        vm.warp(t0 + d1); // at unlocksAt: unlocked
+        assertFalse(keystore.isLocked(account));
+
+        _signedLock(pk, account, d2);
+        assertTrue(keystore.isLocked(account));
+    }
+
+    /// @notice While locked, an authority op (authorize) reverts AccountIsLocked but an environment op (bump)
+    ///         succeeds — the lock freezes the actor set, not the epoch.
+    function test_lock_bumpSucceedsAuthorizeFails(uint256 pkSeed) public {
+        uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+
+        _signedLock(pk, account, 1 hours);
+
+        // Bump under lock: allowed.
+        _applyLocal(pk, account, _one(_bumpChange()));
+        (uint32 epoch,) = _localEpochSeq(account);
+        assertEq(epoch, 1);
+
+        // Authorize under lock: rejected.
+        Keystore.SignedAccountChanges memory s = _localBatch(
+            pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+        vm.expectRevert(Keystore.AccountIsLocked.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice After a full unlock cycle elapses, an authority op is accepted again (lazy lock clear).
+    function test_lock_success_authorizeAfterFullUnlockCycle(uint256 pkSeed, uint16 delay, uint256 t0) public {
+        uint256 pk = _boundK1Pk(pkSeed);
         (address account,) = _createK1Account(pk);
+        delay = uint16(bound(delay, 1, type(uint16).max));
+        t0 = bound(t0, block.timestamp, 1e9);
 
         _signedLock(pk, account, delay);
         vm.warp(t0);
         _signedUnlock(pk, account);
-        vm.warp(bound(within, t0, t0 + delay - 1)); // strictly before unlocksAt == t0 + delay: still frozen
+        vm.warp(t0 + delay); // unlocked
+        assertFalse(keystore.isLocked(account));
 
-        Keystore.ActorChange[] memory changes = _oneAuthorizeChange(bytes32(bytes20(vm.addr(pk))));
-        uint64 chainId = uint64(block.chainid);
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, chainId, seq, changes);
-        bytes memory auth = _buildK1Auth(pk, digest);
+        _applyLocal(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), "")));
+        assertTrue(_isActor(account, ACTOR_A));
+    }
 
-        vm.expectRevert(Keystore.AccountIsLocked.selector);
-        keystore.applySignedActorChanges(account, chainId, changes, auth);
+    /// @notice Lock-residue overwrite. A full lock -> initiate-unlock -> elapse cycle leaves FLAG_UNLOCK_INITIATED set
+    ///         and a now-elapsed unlocksAt in storage (lock reads never clear them). A fresh Lock over that residue must
+    ///         land a CLEAN hard-lock: FLAG_LOCKED set, FLAG_UNLOCK_INITIATED clear (init == false), and lockUnion
+    ///         holding the NEW delay rather than the stale timestamp. This pins the load-bearing `& ~FLAG_UNLOCK_INITIATED`
+    ///         clear in _applyLock: dropping it would leave a delay-valued union under a set INITIATED flag (the
+    ///         union-corruption bug).
+    function test_lock_success_overwritesElapsedUnlockResidue(uint256 pkSeed, uint16 d1, uint16 d2, uint256 t0) public {
+        uint256 pk = _boundK1Pk(pkSeed);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+        d1 = uint16(bound(d1, 1, type(uint16).max));
+        d2 = uint16(bound(d2, 1, type(uint16).max));
+        t0 = bound(t0, block.timestamp, 1e9);
+
+        // Lock, initiate unlock, and let the delay fully elapse. Storage residue now reads unlocked but still carries
+        // FLAG_LOCKED | FLAG_UNLOCK_INITIATED with an elapsed timestamp in lockUnion.
+        _signedLock(pk, account, d1);
+        vm.warp(t0);
+        _signedUnlock(pk, account);
+        vm.warp(t0 + d1);
+        assertFalse(keystore.isLocked(account));
+
+        // Re-lock over the residue.
+        _signedLock(pk, account, d2);
+
+        // Clean hard-lock: INITIATED cleared and the union holds the new delay (surfaced as storedDelay), not the
+        // stale timestamp.
+        (bool locked, bool init, uint48 unlocksAt, uint16 storedDelay) = keystore.getLockStatus(account);
+        assertTrue(locked);
+        assertFalse(init);
+        assertEq(unlocksAt, type(uint48).max);
+        assertEq(storedDelay, d2);
+    }
+
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+    // ADMIN-ONLY LOCK CHANGES
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+
+    /// @notice A scoped (non-admin) actor cannot initiate an Unlock — every signed change is admin-only
+    ///         (UnauthorizedAccountChange).
+    function test_lock_revert_scopedActorCannotUnlock(uint256 ownerSeed, uint256 scopedSeed) public {
+        uint256 ownerPk = _boundK1Pk(ownerSeed);
+        uint256 scopedPk = _boundK1Pk(scopedSeed);
+        vm.assume(vm.addr(ownerPk) != vm.addr(scopedPk));
+        (address account,) = _createK1Account(ownerPk);
+        bytes32 scopedId = bytes32(uint256(uint160(vm.addr(scopedPk))));
+
+        _applyLocal(ownerPk, account, _one(_authorizeChange(scopedId, address(k1Authenticator), SENDER, UNBOUNDED, "")));
+        _signedLock(ownerPk, account, 1 hours);
+        assertTrue(keystore.isLocked(account));
+
+        Keystore.SignedAccountChanges memory s = _localBatch(scopedPk, account, _one(_unlockChange()));
+        vm.expectRevert(Keystore.UnauthorizedAccountChange.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+    // MULTICHAIN CHANNEL
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+
+    /// @notice A Multichain authorize consumes only the multichain counter and leaves the local word untouched.
+    function test_multichain_success_authorize(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+        uint64 localBefore = _localSeqWord(account);
+        uint64 mcBefore = _multichainSeq(account);
+
+        _applyMultichain(
+            pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+
+        assertTrue(_isActor(account, ACTOR_A));
+        assertEq(_localSeqWord(account), localBefore); // local channel untouched
+        assertEq(_multichainSeq(account), mcBefore + 1);
+    }
+
+    /// @notice An IncrementLocalEpoch on the Multichain channel reverts ChangeRequiresLocalChannel.
+    function test_multichain_revert_bumpRejected(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        Keystore.SignedAccountChanges memory s = _multichainBatch(pk, account, _one(_bumpChange()));
+        vm.expectRevert(Keystore.ChangeRequiresLocalChannel.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice A Lock on the Multichain channel reverts ChangeRequiresLocalChannel.
+    function test_multichain_revert_lockRejected(uint256 pk, uint16 delay) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+        delay = uint16(bound(delay, 1, type(uint16).max));
+
+        Keystore.SignedAccountChanges memory s = _multichainBatch(pk, account, _one(_lockChange(delay)));
+        vm.expectRevert(Keystore.ChangeRequiresLocalChannel.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice an Unlock on the Multichain channel reverts ChangeRequiresLocalChannel.
+    function test_multichain_revert_unlockRejected(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        Keystore.SignedAccountChanges memory s = _multichainBatch(pk, account, _one(_unlockChange()));
+        vm.expectRevert(Keystore.ChangeRequiresLocalChannel.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+    // REGRESSION (split layout / deleted entry points)
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+
+    /// @notice A freshly created account starts at epoch 0, sequence 1 (the non-zero initialized flag) with a zero
+    ///         multichain counter.
+    function test_regression_initFlagUnderSplitLayout(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        (uint32 epoch, uint32 seq) = _localEpochSeq(account);
+        assertEq(epoch, 0);
+        assertEq(seq, 1);
+        assertEq(keystore.getChangeSequences(account).localSequence, 1);
+        assertEq(keystore.getChangeSequences(account).multichain, 0);
+    }
+
+    /// @notice The deleted entry points (applySignedActorChanges / applySignedLockChanges) are absent from the ABI —
+    ///         a call to their old selector finds no function and reverts.
+    function test_regression_deletedEntryPointsAbsent(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        (bool ok1,) = address(keystore)
+            .call(
+                abi.encodeWithSignature(
+                    "applySignedLockChanges(address,uint8,uint16,bytes)", account, uint8(1), uint16(3600), bytes("")
+                )
+            );
+        assertFalse(ok1);
+
+        (bool ok2,) = address(keystore)
+            .call(
+                abi.encodeWithSignature(
+                    "applySignedActorChanges(address,uint64,bytes,bytes)", account, uint64(0), bytes(""), bytes("")
+                )
+            );
+        assertFalse(ok2);
+    }
+
+    /// @notice Regression: an IncrementLocalEpoch zeroes localSequence, but the account must still read as
+    ///         initialized (localEpoch is now non-zero) so the one-time importAccount bootstrap stays closed. Prior
+    ///         to the fix, _isInitialized checked localSequence alone, so a post-increment local-only account looked
+    ///         uninitialized and importAccount would re-bootstrap on top of the live actor set.
+    function test_regression_importBlockedAfterEpochIncrement(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        // Increment the epoch: localSequence -> 0, localEpoch -> 1 (both counters no longer trivially non-zero on the
+        // sequence half).
+        _applyLocal(pk, account, _one(_bumpChange()));
+        (uint32 epoch, uint32 seq) = _localEpochSeq(account);
+        assertEq(epoch, 1);
+        assertEq(seq, 0);
+
+        // importAccount must still reject the account as already initialized. The check fires before the ERC-1271
+        // staticcall, so the empty signature is never reached.
+        Keystore.InitialActor[] memory actors = new Keystore.InitialActor[](1);
+        actors[0] = Keystore.InitialActor({
+            actorId: bytes32(uint256(uint160(account))), authenticator: address(1), scope: 0, policyData: ""
+        });
+        vm.expectRevert(Keystore.AlreadyInitialized.selector);
+        keystore.importAccount(account, 0, actors, "");
+    }
+
+    /// @notice An empty sequenced batch is rejected (EmptyChangeSet) so it cannot consume a sequence doing nothing.
+    function test_apply_revert_emptyBatchSequenced(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        Keystore.SignedAccountChanges memory s = _localBatch(pk, account, new Keystore.AccountChange[](0));
+        vm.expectRevert(Keystore.EmptyChangeSet.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice An empty unsequenced batch is rejected (EmptyChangeSet) so it cannot initialize a fresh account without
+    ///         altering any configuration.
+    function test_apply_revert_emptyBatchUnsequenced(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        Keystore.SignedAccountChanges memory s = _unseqBatch(pk, account, new Keystore.AccountChange[](0));
+        vm.expectRevert(Keystore.EmptyChangeSet.selector);
+        keystore.applySignedAccountChanges(account, s);
+    }
+
+    /// @notice A never-bootstrapped EOA acting via its inline k1 self on its first unsequenced batch is marked
+    ///         initialized: the batch burns local sequence 0 (0 -> 1), closing the one-time importAccount bootstrap and
+    ///         invalidating any outstanding sequenced seq==0 signature. The batch itself remains replayable.
+    function test_regression_unsequencedInitBlocksImport(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+
+        // Uninitialized: both local counters are zero.
+        (uint32 epoch0, uint32 seq0) = _localEpochSeq(account);
+        assertEq(epoch0, 0);
+        assertEq(seq0, 0);
+
+        _applyUnsequenced(
+            pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+
+        // Sequence 0 burned -> reads initialized; the actor landed.
+        (uint32 epoch1, uint32 seq1) = _localEpochSeq(account);
+        assertEq(epoch1, 0);
+        assertEq(seq1, 1);
+        assertTrue(_isActor(account, ACTOR_A));
+
+        // importAccount must now reject the account as already initialized.
+        Keystore.InitialActor[] memory actors = new Keystore.InitialActor[](1);
+        actors[0] = Keystore.InitialActor({
+            actorId: bytes32(uint256(uint160(account))), authenticator: address(1), scope: 0, policyData: ""
+        });
+        vm.expectRevert(Keystore.AlreadyInitialized.selector);
+        keystore.importAccount(account, 0, actors, "");
+    }
+
+    /// @notice Init asymmetry (fresh-account branch): a never-bootstrapped EOA's first LOCAL unsequenced batch burns
+    ///         local sequence 0 -> 1, so any sequenced-at-0 signature it had already produced is now dead (BadSequence).
+    ///         This is the side of the asymmetry that the unsequenced-init write creates.
+    function test_init_unsequencedFirstBatchKillsSequenceZero(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+
+        // A sequenced local batch at seq 0, captured while the account is still fresh (epoch 0, seq 0).
+        Keystore.SignedAccountChanges memory seqZero = _localBatch(
+            pk, account, _one(_authorizeChange(ACTOR_B, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+
+        // First act is an unsequenced batch: burns local sequence 0 -> 1 (marks initialized).
+        _applyUnsequenced(
+            pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+        (, uint32 seq1) = _localEpochSeq(account);
+        assertEq(seq1, 1);
+
+        // The pre-signed sequenced-at-0 batch no longer matches the advanced counter.
+        vm.expectRevert(Keystore.BadSequence.selector);
+        keystore.applySignedAccountChanges(account, seqZero);
+    }
+
+    /// @notice Init asymmetry (multichain-active branch): once an EOA has bootstrapped via the Multichain channel it
+    ///         already reads initialized, so a later first LOCAL unsequenced batch does NOT burn local sequence 0. The
+    ///         local sequenced-at-0 slot stays live and a sequenced-at-0 batch still lands — the opposite of a fresh
+    ///         account, pinned deliberately.
+    function test_init_multichainActiveKeepsLocalSequenceZero(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        address account = vm.addr(pk);
+        _assumeSafeAccount(account);
+
+        // Bootstrap via multichain: multichain counter 0 -> 1, local word stays 0/0 (initialized via the multichain
+        // term of _isInitialized).
+        _applyMultichain(
+            pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+        (uint32 epoch0, uint32 seq0) = _localEpochSeq(account);
+        assertEq(epoch0, 0);
+        assertEq(seq0, 0);
+
+        // A local unsequenced batch: the unsequenced-init write is skipped (already initialized), so localSequence
+        // stays 0.
+        _applyUnsequenced(
+            pk, account, _one(_authorizeChange(ACTOR_B, address(k1Authenticator), SENDER, _future(1 days), ""))
+        );
+        (, uint32 seq1) = _localEpochSeq(account);
+        assertEq(seq1, 0);
+
+        // A local sequenced batch at seq 0 therefore still lands (seq 0 == localSequence 0), consuming 0 -> 1.
+        bytes32 idC = bytes32(uint256(0xC3));
+        _applyLocal(pk, account, _one(_authorizeChange(idC, address(k1Authenticator), SENDER, _future(1 days), "")));
+        assertTrue(_isActor(account, idC));
+        (, uint32 seq2) = _localEpochSeq(account);
+        assertEq(seq2, 1);
     }
 }

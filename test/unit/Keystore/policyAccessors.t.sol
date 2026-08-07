@@ -78,7 +78,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ) public {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         uint16 scope = _boundGatedScope(scopeSeed);
         address manager = _boundNonZeroAddress(managerSeed);
@@ -97,7 +97,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ///         home (else-if true, no _actorConfig, not revoked) with no policy slots written.
     function test_getPolicy_success_inlineSelfUngated_returnsNone(uint256 eoaSeed) public view {
         address eoa = vm.addr(_boundK1Pk(eoaSeed));
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         (address outManager, bytes32 outCommitment) = keystore.getPolicy(eoa, selfActorId);
         assertEq(outManager, address(0));
@@ -110,7 +110,7 @@ contract PolicyAccessorsTest is KeystoreTest {
 
     /// @notice An unknown (never-authorized, non-self) actor: getPolicy returns (0, 0) over empty state.
     function test_getPolicy_success_unknownActor_returnsNone(address account, bytes32 actorId) public view {
-        vm.assume(actorId != bytes32(bytes20(account))); // stay off the inline-self else-if
+        vm.assume(actorId != bytes32(uint256(uint160(account)))); // stay off the inline-self else-if
 
         (address outManager, bytes32 outCommitment) = keystore.getPolicy(account, actorId);
         assertEq(outManager, address(0));
@@ -129,7 +129,7 @@ contract PolicyAccessorsTest is KeystoreTest {
         (address eoa, uint256 ownerPk) = _seedGatedInlineSelfWithSpareOwner(
             eoaSeed, ownerSeed, scopeSeed, managerSeed, commitmentSeed
         );
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         // Revoke the (downgraded) self via the spare unrestricted owner; the policy-scoped self cannot sign config.
         _revokeActor(eoa, ownerPk, selfActorId);
@@ -189,7 +189,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ) public {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizeInlineSelfWithPolicy(
@@ -207,7 +207,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ) public {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         bytes32 commitment = _boundNonZeroWord(commitmentSeed);
         _authorizeInlineSelfWithPolicy(
@@ -288,7 +288,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ) public {
         (address eoa, uint256 ownerPk) =
             _seedGatedInlineSelfWithSpareOwner(eoaSeed, ownerSeed, scopeSeed, managerSeed, commitmentSeed);
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         // Live first.
         assertTrue(keystore.getPolicyManager(eoa, selfActorId) != address(0));
@@ -395,7 +395,7 @@ contract PolicyAccessorsTest is KeystoreTest {
         for (uint256 i; i < otherScopes.length; i++) {
             // Policy actors are keyed by actorId only; no signing key is needed, so a distinct address-shaped id
             // avoids the vm.addr curve-order bound on an unbounded rootPk + i.
-            bytes32 actorId = bytes32(bytes20(address(uint160(1000 + i))));
+            bytes32 actorId = bytes32(uint256(uint160(address(uint160(1000 + i)))));
             uint16 scope = otherScopes[i] | Scopes.POLICY;
             _authorizePolicyActor(account, rootPk, actorId, scope, manager, commitment);
 
@@ -457,11 +457,12 @@ contract PolicyAccessorsTest is KeystoreTest {
         uint256 rootPk = _boundK1Pk(rootSeed);
         (address accountA,) = _createK1AccountWithSalt(rootPk, saltA);
         (address accountB,) = _createK1AccountWithSalt(rootPk, saltB);
-        bytes32 rootActorId = bytes32(bytes20(vm.addr(rootPk)));
-        // Keep the shared actorId a non-self, non-owner explicit actor on both accounts.
+        bytes32 rootActorId = bytes32(uint256(uint160(vm.addr(rootPk))));
+        // Keep the shared actorId a non-zero, non-self, non-owner explicit actor on both accounts.
+        vm.assume(sharedActorId != bytes32(0)); // the zero actorId is rejected by AuthorizeActor (InvalidActorId)
         vm.assume(sharedActorId != rootActorId);
-        vm.assume(sharedActorId != bytes32(bytes20(accountA)));
-        vm.assume(sharedActorId != bytes32(bytes20(accountB)));
+        vm.assume(sharedActorId != bytes32(uint256(uint160(accountA))));
+        vm.assume(sharedActorId != bytes32(uint256(uint160(accountB))));
 
         uint16 scope = _boundGatedScope(scopeSeed);
         address managerA = _boundNonZeroAddress(managerSeedA);
@@ -500,7 +501,7 @@ contract PolicyAccessorsTest is KeystoreTest {
 
         (address account,) = _createK1Account(rootPk);
         vm.assume(vm.addr(sessionPk) != account); // stay off the inline-self path
-        bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
+        bytes32 sessionActorId = bytes32(uint256(uint160(vm.addr(sessionPk))));
 
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizePolicyActor(
@@ -522,7 +523,7 @@ contract PolicyAccessorsTest is KeystoreTest {
 
         (address account,) = _createK1Account(rootPk);
         vm.assume(vm.addr(sessionPk) != account);
-        bytes32 sessionActorId = bytes32(bytes20(vm.addr(sessionPk)));
+        bytes32 sessionActorId = bytes32(uint256(uint160(vm.addr(sessionPk))));
 
         _authorizeUngatedActor(account, rootPk, sessionActorId, address(k1Authenticator));
 
@@ -540,7 +541,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     ) public {
         uint256 eoaPk = _boundK1Pk(eoaSeed);
         address eoa = vm.addr(eoaPk);
-        bytes32 selfActorId = bytes32(bytes20(eoa));
+        bytes32 selfActorId = bytes32(uint256(uint160(eoa)));
 
         address manager = _boundNonZeroAddress(managerSeed);
         _authorizeInlineSelfWithPolicy(
@@ -559,7 +560,7 @@ contract PolicyAccessorsTest is KeystoreTest {
 
         (, uint16 outScope) = keystore.authenticateActor(eoa, hash, _buildK1Auth(eoaPk, hash));
         assertEq(outScope, uint16(0x00));
-        assertEq(keystore.getPolicyManager(eoa, bytes32(bytes20(eoa))), address(0));
+        assertEq(keystore.getPolicyManager(eoa, bytes32(uint256(uint160(eoa)))), address(0));
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
@@ -585,14 +586,15 @@ contract PolicyAccessorsTest is KeystoreTest {
     ///      self-actorId (which would route to the inline-self home) and from the root owner's actorId (which would
     ///      overwrite the owner). actorId is otherwise an opaque bytes32 the protocol does not format-check.
     function _boundExplicitActorId(address account, uint256 rootPk, bytes32 actorId) internal pure returns (bytes32) {
-        vm.assume(actorId != bytes32(bytes20(account)));
-        vm.assume(actorId != bytes32(bytes20(vm.addr(rootPk))));
+        vm.assume(actorId != bytes32(0)); // the zero actorId is rejected by AuthorizeActor (InvalidActorId)
+        vm.assume(actorId != bytes32(uint256(uint160(account))));
+        vm.assume(actorId != bytes32(uint256(uint160(vm.addr(rootPk)))));
         return actorId;
     }
 
     /// @dev Seed a gated inline-k1 self plus a spare unrestricted owner able to sign a later self-revoke. Returns
     ///      (eoa, spareOwnerPk). The self is downgraded to a policy scope (admin is exactly scope == 0) and thus
-    ///      cannot sign config changes, so the spare owner is what revokes it.
+    ///      cannot sign account changes, so the spare owner is what revokes it.
     function _seedGatedInlineSelfWithSpareOwner(
         uint256 eoaSeed,
         uint256 ownerSeed,
@@ -604,8 +606,8 @@ contract PolicyAccessorsTest is KeystoreTest {
         ownerPk = _boundK1Pk(ownerSeed);
         vm.assume(vm.addr(eoaPk) != vm.addr(ownerPk));
         eoa = vm.addr(eoaPk);
-        bytes32 ownerActorId = bytes32(bytes20(vm.addr(ownerPk)));
-        vm.assume(ownerActorId != bytes32(bytes20(eoa)));
+        bytes32 ownerActorId = bytes32(uint256(uint160(vm.addr(ownerPk))));
+        vm.assume(ownerActorId != bytes32(uint256(uint160(eoa))));
 
         // Pre-authorize the spare unrestricted owner (signed by the still-full-owner self).
         _authorizeUngatedActor(eoa, eoaPk, ownerActorId, address(k1Authenticator));
@@ -625,7 +627,7 @@ contract PolicyAccessorsTest is KeystoreTest {
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
     /// @dev Authorize a non-self actor with a gated policy bound to (manager, commitment), signed by the root owner.
-    ///      `scope` must carry SCOPE_POLICY.
+    ///      `scope` must carry SCOPE_POLICY. Granted UNBOUNDED on a sequenced local batch (the new "no expiry").
     function _authorizePolicyActor(
         address account,
         uint256 rootPk,
@@ -634,18 +636,15 @@ contract PolicyAccessorsTest is KeystoreTest {
         address policyManager,
         bytes32 commitment
     ) internal {
-        Keystore.ActorConfig memory cfg =
-            Keystore.ActorConfig({authenticator: address(k1Authenticator), scope: scope, expiry: 0});
-        bytes memory policyData = abi.encodePacked(policyManager, commitment);
-
-        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({
-            actorId: actorId, changeType: Keystore.ActorChangeType.Authorize, data: abi.encode(cfg, policyData)
-        });
-
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, uint64(block.chainid), seq, changes);
-        keystore.applySignedActorChanges(account, uint64(block.chainid), changes, _buildK1Auth(rootPk, digest));
+        _applyLocal(
+            rootPk,
+            account,
+            _one(
+                _authorizeChange(
+                    actorId, address(k1Authenticator), scope, UNBOUNDED, abi.encodePacked(policyManager, commitment)
+                )
+            )
+        );
     }
 
     /// @dev Authorize the EOA's self-actorId as a scoped k1 actor carrying a gated policy. The EOA is not
@@ -658,40 +657,27 @@ contract PolicyAccessorsTest is KeystoreTest {
         address policyManager,
         bytes32 commitment
     ) internal {
-        bytes32 selfActorId = bytes32(bytes20(eoa));
-        Keystore.ActorConfig memory cfg =
-            Keystore.ActorConfig({authenticator: keystore.K1_AUTHENTICATOR(), scope: scope, expiry: 0});
-        bytes memory policyData = abi.encodePacked(policyManager, commitment);
-
-        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({
-            actorId: selfActorId, changeType: Keystore.ActorChangeType.Authorize, data: abi.encode(cfg, policyData)
-        });
-
-        uint64 seq = keystore.getChangeSequences(eoa).local;
-        bytes32 digest = _computeActorChangeBatchDigest(eoa, uint64(block.chainid), seq, changes);
-        keystore.applySignedActorChanges(eoa, uint64(block.chainid), changes, _buildK1Auth(eoaPk, digest));
+        _applyLocal(
+            eoaPk,
+            eoa,
+            _one(
+                _authorizeChange(
+                    bytes32(uint256(uint160(eoa))),
+                    keystore.K1_AUTHENTICATOR(),
+                    scope,
+                    UNBOUNDED,
+                    abi.encodePacked(policyManager, commitment)
+                )
+            )
+        );
     }
 
-    /// @dev Authorize an ungated (scope 0) actor under `authenticator`, signed by `pk`.
+    /// @dev Authorize an ungated (scope 0) actor under `authenticator`, signed by `pk`. Batched with an epoch bump so
+    ///      overwriting a previously gated actor down to ungated (a scope reduction) is permitted.
     function _authorizeUngatedActor(address account, uint256 pk, bytes32 newActorId, address authenticator) internal {
-        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({
-            actorId: newActorId,
-            changeType: Keystore.ActorChangeType.Authorize,
-            data: abi.encode(Keystore.ActorConfig({authenticator: authenticator, scope: 0x00, expiry: 0}), bytes(""))
-        });
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, uint64(block.chainid), seq, changes);
-        keystore.applySignedActorChanges(account, uint64(block.chainid), changes, _buildK1Auth(pk, digest));
-    }
-
-    /// @dev Revoke `actorId` from `account`, signed by `pk`.
-    function _revokeActor(address account, uint256 pk, bytes32 actorId) internal {
-        Keystore.ActorChange[] memory changes = new Keystore.ActorChange[](1);
-        changes[0] = Keystore.ActorChange({actorId: actorId, changeType: Keystore.ActorChangeType.Revoke, data: ""});
-        uint64 seq = keystore.getChangeSequences(account).local;
-        bytes32 digest = _computeActorChangeBatchDigest(account, uint64(block.chainid), seq, changes);
-        keystore.applySignedActorChanges(account, uint64(block.chainid), changes, _buildK1Auth(pk, digest));
+        Keystore.AccountChange[] memory ch = new Keystore.AccountChange[](2);
+        ch[0] = _authorizeChange(newActorId, authenticator, 0x00, UNBOUNDED, "");
+        ch[1] = _bumpChange();
+        _applyLocal(pk, account, ch);
     }
 }

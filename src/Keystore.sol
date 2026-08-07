@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.36;
 
+import {ActorId} from "./libraries/ActorId.sol";
 import {IAuthenticator} from "./interfaces/IAuthenticator.sol";
 import {Scopes} from "./libraries/Scopes.sol";
 
@@ -17,8 +18,9 @@ contract Keystore {
 
     /// @notice Per-account replay counters for signed changes.
     struct ChangeSequences {
-        uint64 multichain; // chain_id 0
-        uint64 local; // chain_id == block.chainid; starts at 1 once initialized (created/imported), 0 = uninitialized
+        uint64 multichain; // chain_id 0 (multichain channel)
+        uint32 localEpoch; // local channel epoch; incremented by IncrementLocalEpoch, invalidates unlanded local signatures
+        uint32 localSequence; // current local counter; reset to 0 by IncrementLocalEpoch
     }
 
     /// @notice An actor's authorization: authenticator, expiry, and scope. Field order matches the normative
@@ -31,7 +33,7 @@ contract Keystore {
 
     /// @notice Initial actor for account creation and import. Carries its scope and, when scope & Scopes.POLICY is
     ///         set, its policy data; expiry is always 0 for initial actors (scoped-with-expiry keys are added later
-    ///         via applySignedActorChanges).
+    ///         via applySignedAccountChanges).
     struct InitialActor {
         bytes32 actorId;
         address authenticator;
@@ -47,60 +49,79 @@ contract Keystore {
         bytes policyData;
     }
 
-    /// @notice The operation an {ActorChange} applies within an {applySignedActorChanges} batch.
+    /// @notice The operation an {AccountChange} applies within an {applySignedAccountChanges} batch.
     ///
-    /// @dev ABI-encodes as uint8, so the wire values are preserved (Authorize = 0x01, Revoke = 0x02) and the
-    ///      SignedActorChanges typehash keeps `uint8 changeType` — digests and the external ABI selector are
-    ///      unchanged. Invalid (0) is the reachable "unrecognized" case, rejected in-handler with {UnknownActorChangeType};
-    ///      out-of-range wire values (>= 3) can never reach the handler — the enum decoder rejects them (reverts)
-    ///      while ABI-decoding the calldata.
-    enum ActorChangeType {
-        Invalid,
-        Authorize,
-        Revoke
+    /// @dev ABI-encodes as uint8. Authority ops (AuthorizeActor, RevokeActor) are rejected while locked. Environment
+    ///      ops enforce their own lock preconditions; Lock and Unlock are Local-only and must each be the batch's only
+    ///      op.
+    enum ChangeType {
+        // Authority ops (mutate who can act).
+        AuthorizeActor, // payload: abi.encode(bytes32 actorId, ActorConfig cfg, bytes policyData); cfg.expiry is the granted expiry
+        RevokeActor, // payload: abi.encode(bytes32 actorId)
+        // Environment ops (mutate the rules ops are checked against).
+        IncrementLocalEpoch, // Local only; payload: empty (length == 0 enforced)
+        Lock, // Local only; payload: abi.encode(uint16 unlockDelay)
+        Unlock // Local only; payload: empty (length == 0 enforced)
     }
 
-    /// @notice The operation an {applySignedLockChanges} call applies.
+    /// @notice The replay domain a {SignedAccountChanges} batch is bound to.
     ///
-    /// @dev ABI-encodes as uint8, so the wire values are preserved (Lock = 0x01, Unlock = 0x02) and the
-    ///      SignedLockChange typehash keeps `uint8 op` — digests and the external ABI selector are unchanged.
-    ///      Invalid (0) is the reachable "unrecognized" case, rejected in-handler with {UnknownLockChangeType}; out-of-range
-    ///      wire values (>= 3) can never reach the handler — the enum decoder rejects them (reverts) while
-    ///      ABI-decoding the calldata.
-    enum LockChangeType {
-        Invalid,
-        Lock,
-        Unlock
+    /// @dev Replaces the prior `uint256 chainId` argument. {Local} binds `block.chainid` and carries the full local
+    ///      epoch machinery (see {SignedAccountChanges.sequence}); {Multichain} binds chainId 0 and keeps a plain
+    ///      monotonic counter with no epochs and no unsequenced (JIT) mode. {IncrementLocalEpoch}, {Lock}, and
+    ///      {Unlock} are rejected on the Multichain channel.
+    enum AccountChangeChannel {
+        Local,
+        Multichain
     }
 
-    /// @notice A single authorize/revoke operation within a signed batch.
-    struct ActorChange {
-        ActorChangeType changeType; // Authorize or Revoke (Invalid rejected in-handler)
-        bytes32 actorId;
-        bytes data; // operation-specific: ActorConfig || policyData for authorize, empty for revoke
+    /// @notice A single operation within a signed batch: its type and an operation-specific ABI-encoded payload.
+    struct AccountChange {
+        ChangeType changeType;
+        bytes payload;
+    }
+
+    /// @notice An ordered, atomic batch of account changes with its replay binding and signature.
+    ///
+    /// @dev `changes` are applied in order, all-or-nothing (intersection-strict: any rejected op reverts the whole
+    ///      batch). `sequence` is interpreted per `channel`:
+    ///        - Local: localEpoch(32, high) || localSequence(32, low). A low half equal to {UNSEQUENCED} marks the
+    ///          batch as unsequenced (JIT) — it does not consume a sequence (so it stays replayable until the epoch
+    ///          moves); any other low value is a sequenced batch consumed against the account's localSequence.
+    ///        - Multichain: a plain uint64 consumed against the account's multichainSequence; never {UNSEQUENCED},
+    ///          never carries an epoch.
+    ///      `signature` is the standard authenticator(20) || authenticator-data blob authenticating the signer.
+    struct SignedAccountChanges {
+        AccountChangeChannel channel;
+        uint64 sequence;
+        AccountChange[] changes;
+        bytes signature;
     }
 
     /// @notice Per-account packed state: sequences, lock status, and the inline home for the account's k1 self key.
     ///
     /// @dev Packed into a single storage slot; the field layout is normative (nodes read the raw slot for mempool
     ///      rate-limit tiering, see the EIP's Account Lock section). Field order and widths match the spec's
-    ///      account-state table: multichainSequence, localSequence, flags, lockUnion, defaultEOAExpiry,
+    ///      account-state table: multichainSequence, localSequence, localEpoch, flags, lockUnion, defaultEOAExpiry,
     ///      defaultEOAScope, then 1 reserved byte that MUST stay zero.
-    ///      localSequence > 0 doubles as the account initialized flag.
-    ///      `flags` is a bitfield: bit 0 (FLAG_REVOKE_DEFAULT_EOA) disables the k1 self key; bit 1 (FLAG_LOCKED)
-    ///      freezes actor configuration; bit 2 (FLAG_UNLOCK_INITIATED) selects how `lockUnion` is interpreted.
-    ///      `lockUnion` is a union field: while FLAG_UNLOCK_INITIATED is clear it holds the configured unlock delay
-    ///      (seconds, uint16 range); while set it holds unlocksAt (the timestamp at which the unlock takes effect).
-    ///      The defaultEOA* fields are the inline home for the account's own secp256k1 ("self") key — the actor whose
-    ///      actorId is bytes32(bytes20(account)). When FLAG_REVOKE_DEFAULT_EOA is unset, a k1 signature recovering to
-    ///      the account authenticates with this inline config (all-zero = full owner; non-zero scope/expiry = a
+    ///      The local replay counter is stored as two adjacent uint32 fields — `localSequence` (low) then `localEpoch`
+    ///      (high) — which occupy the same 8 bytes as, and read identically to, the single `localEpoch(32)||
+    ///      localSequence(32)` word committed in a signed batch's `sequence` (see {getChangeSequences}). Storing
+    ///      them split keeps the layout size-neutral (still one slot) while removing pack/unpack math from the hot path.
+    ///      The combined local word marks local initialization; the multichain counter covers global-only activity.
+    ///      {IncrementLocalEpoch} resets the sequence while keeping the combined local word non-zero.
+    ///      See {FLAG_REVOKE_DEFAULT_EOA}, {FLAG_LOCKED}, and {FLAG_UNLOCK_INITIATED} for `flags` and `lockUnion`.
+    ///      The defaultEOA* fields are the inline home for the account's own secp256k1 ("self") key, whose actorId is
+    ///      `ActorId.fromAddress(account)`. When FLAG_REVOKE_DEFAULT_EOA is unset, a k1 signature recovering to the
+    ///      account authenticates with this inline config (all-zero = full owner; non-zero scope/expiry = a
     ///      scoped self key), resolved in a single SLOAD. Policy gating (when scope & Scopes.POLICY != 0) is still keyed
     ///      by actorId in the shared _policyManager/_policyCommitment keyspace. The separate _actorConfig[self][account]
     ///      slot is reserved for a *non-k1* self authenticator (e.g. a post-quantum verifier returning the
     ///      self-actorId); the two homes are mutually exclusive (see _authorizeActor).
     struct AccountState {
         uint64 multichainSequence; // 8 bytes
-        uint64 localSequence; // 8 bytes – also serves as initialized flag
+        uint32 localSequence; // 4 bytes – low half of the signed local word
+        uint32 localEpoch; // 4 bytes – high half of the signed local word
         uint8 flags; // 1 byte – bitfield: bit 0 REVOKE_DEFAULT_EOA, bit 1 LOCKED, bit 2 UNLOCK_INITIATED
         uint48 lockUnion; // 6 bytes – union: unlockDelay while UNLOCK_INITIATED clear, else unlocksAt (timestamp)
         uint48 defaultEOAExpiry; // 6 bytes – inline self k1 expiry (Unix seconds; 0 = no expiry)
@@ -116,13 +137,14 @@ contract Keystore {
     ///      (0x1626ba7e); used both to build the import staticcall and to validate its result.
     bytes4 internal constant ERC1271_SELECTOR = bytes4(keccak256("isValidSignature(bytes32,bytes)"));
 
-    /// @notice Typehash binding an importAccount signature to its salt, chainId, and initial actor set.
+    /// @notice Typehash binding an importAccount signature to its accountId, chainId, and initial actor set.
     ///
-    /// @dev NOT compliant with EIP-712, to mitigate eth_signTypedData phishing. Bound to the current chainId so an
-    ///      import signature cannot be replayed on another chain. Initial actors are hashed structurally via
-    ///      ACTOR_TYPEHASH / ACTOR_CONFIG_TYPEHASH below.
+    /// @dev NOT compliant with EIP-712, to mitigate eth_signTypedData phishing. `accountId` is the importing account's
+    ///      actorId (`ActorId.fromAddress(account)`), binding the digest to that account so it cannot be replayed
+    ///      against another. `chainId` is either the current chain or 0 for a multichain import. Initial actors are
+    ///      hashed structurally below.
     bytes32 public constant ACTOR_INITIALIZATION_TYPEHASH = keccak256(
-        "ActorInitialization(bytes32 salt,uint256 chainId,Actor[] initialActors)Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint48 expiry,uint16 scope)"
+        "ActorInitialization(bytes32 accountId,uint256 chainId,Actor[] initialActors)Actor(bytes32 actorId,ActorConfig config,bytes policyData)ActorConfig(address authenticator,uint48 expiry,uint16 scope)"
     );
 
     /// @notice Typehash used to structurally hash each Actor within an ActorInitialization import digest.
@@ -134,24 +156,24 @@ contract Keystore {
     bytes32 public constant ACTOR_CONFIG_TYPEHASH =
         keccak256("ActorConfig(address authenticator,uint48 expiry,uint16 scope)");
 
-    /// @notice Typehash binding a signed actor-change batch to its account, chainId, and sequence.
+    /// @notice Typehash binding a signed account-change batch to its account, chainId, and sequence.
     ///
-    /// @dev NOT compliant with EIP-712, to mitigate phishing attacks.
-    bytes32 public constant SIGNED_ACTOR_CHANGES_TYPEHASH = keccak256(
-        "SignedActorChanges(address account,uint256 chainId,uint64 sequence,ActorChange[] actorChanges)"
-        "ActorChange(uint8 changeType,bytes32 actorId,bytes data)"
+    /// @dev NOT compliant with EIP-712, to mitigate phishing attacks. `chainId` is the channel's replay domain
+    ///      (0 for {AccountChangeChannel.Multichain}, block.chainid for {AccountChangeChannel.Local}). The digest
+    ///      scheme is confined to {_changesDigest}, keeping it independent of the apply pipeline.
+    bytes32 public constant SIGNED_ACCOUNT_CHANGES_TYPEHASH = keccak256(
+        "SignedAccountChanges(address account,uint256 chainId,uint64 sequence,AccountChange[] changes)"
+        "AccountChange(uint8 changeType,bytes payload)"
     );
 
-    /// @notice Typehash used to structurally hash each ActorChange within a SignedActorChanges batch.
-    bytes32 public constant ACTOR_CHANGE_TYPEHASH =
-        keccak256("ActorChange(uint8 changeType,bytes32 actorId,bytes data)");
+    /// @notice Typehash used to structurally hash each AccountChange within a SignedAccountChanges batch.
+    bytes32 public constant ACCOUNT_CHANGE_TYPEHASH = keccak256("AccountChange(uint8 changeType,bytes payload)");
 
-    /// @notice Typehash binding a signed lock-state change to its account, chainId, op, unlock delay, and sequence.
-    ///
-    /// @dev NOT compliant with EIP-712, to mitigate phishing attacks. Lock changes are local-channel only, so the
-    ///      digest always binds the current chainId (there is no multichain lock).
-    bytes32 public constant LOCK_CHANGE_TYPEHASH =
-        keccak256("SignedLockChange(address account,uint256 chainId,uint8 op,uint16 unlockDelay,uint64 sequence)");
+    /// @notice Local-channel sequence low-half sentinel marking an unsequenced (JIT) batch. A {SignedAccountChanges}
+    ///         whose low 32 bits equal this value does not consume a sequence, so it stays replayable until the local
+    ///         epoch moves. Any op may use it, but Lock and Unlock must remain standalone. Sequenced batches may run up
+    ///         to UNSEQUENCED - 2.
+    uint32 public constant UNSEQUENCED = type(uint32).max;
 
     // ----------------------------------------------------------------------------------------------------------------
     // ACTOR SCOPE
@@ -187,10 +209,8 @@ contract Keystore {
     ///         clears it (re-enabling the inline self, possibly scoped).
     uint8 public constant FLAG_REVOKE_DEFAULT_EOA = 0x01;
 
-    /// @notice AccountState.flags bit (spec `LOCKED`): when set, actor configuration is frozen — all config changes
-    ///         and delegation are rejected on both the account-changes and applySignedActorChanges paths. The only
-    ///         permitted operation while locked is initiating an unlock. Cleared lazily once an initiated unlock
-    ///         elapses (see applySignedLockChanges).
+    /// @notice AccountState.flags bit (spec `LOCKED`): identifies a lock record. The account is frozen unless an
+    ///         initiated unlock's timestamp has elapsed; expired lock bits remain until a later Lock overwrites them.
     uint8 public constant FLAG_LOCKED = 0x02;
 
     /// @notice AccountState.flags bit (spec `UNLOCK_INITIATED`): selects how the packed `lockUnion` field is read.
@@ -268,30 +288,58 @@ contract Keystore {
     /// @notice The signed chainId is neither 0 (multichain) nor the current chain.
     error InvalidChainId();
 
-    /// @notice The authenticated actor lacks the scope required to change actors.
-    error UnauthorizedActorChange();
-
-    /// @notice An ActorChange carried ActorChangeType.Invalid (0). Other unrecognized wire values revert at ABI-decode.
-    error UnknownActorChangeType();
+    /// @notice The batch signer is not the account admin (scope 0). Every signed account change is admin-only.
+    error UnauthorizedAccountChange();
 
     /// @notice The importAccount ERC-1271 signature check did not return the magic value.
     error InvalidImportSignature();
 
-    /// @notice A lock op (op = 1) carried a zero unlock delay.
+    /// @notice A lock op carried a zero unlock delay.
     error ZeroUnlockDelay();
 
-    /// @notice An unlock op (op = 2) was requested when the account was not in the hard-locked state (FLAG_LOCKED set,
+    /// @notice An unlock op was requested when the account was not in the hard-locked state (FLAG_LOCKED set,
     ///         FLAG_UNLOCK_INITIATED clear) — i.e. never locked, or an unlock was already initiated.
     error NotLocked();
 
-    /// @notice applySignedLockChanges carried LockChangeType.Invalid (0). Other unrecognized wire values revert at ABI-decode.
-    error UnknownLockChangeType();
+    /// @notice The batch's committed local epoch does not match the account's current local epoch: every unlanded
+    ///         local signature at a prior epoch is dead. Applies to sequenced and unsequenced Local batches.
+    error StaleEpoch();
 
-    /// @notice An unlock op (op = 2) carried a non-zero unlock delay (unlock delay is set only by the lock op).
-    error InvalidUnlockDelay();
+    /// @notice A sequenced batch's sequence did not match the account's current (local or multichain) counter.
+    error BadSequence();
 
-    /// @notice The authenticated actor lacks the scope required to change the lock state (admin, scope 0, only).
-    error UnauthorizedLockChange();
+    /// @notice The channel's sequence counter is at its terminal value and cannot advance.
+    error SequenceSaturated();
+
+    /// @notice The local epoch is at its terminal value and cannot be incremented.
+    error EpochSaturated();
+
+    /// @notice An AuthorizeActor's granted expiry is non-zero and not strictly in the future (self-expired on
+    ///         arrival). A zero expiry is the "no expiry" sentinel and is accepted.
+    error ExpiredChange();
+
+    /// @notice A local-only change (IncrementLocalEpoch, Lock, or Unlock) was submitted on the Multichain channel.
+    error ChangeRequiresLocalChannel();
+
+    /// @notice A change payload did not match the shape required by its ChangeType (e.g. a non-empty payload on
+    ///         IncrementLocalEpoch / Unlock).
+    error InvalidChangePayload();
+
+    /// @notice A signed batch carried no changes. An empty batch is rejected so it can neither consume a sequence nor
+    ///         initialize a fresh account without altering any configuration.
+    error EmptyChangeSet();
+
+    /// @notice An actor authorization targeted the zero actorId, which is not a usable actor identifier.
+    error InvalidActorId();
+
+    /// @notice A Lock or Unlock appeared in a batch alongside other changes. Lock/unlock must be the sole change in
+    ///         their batch, so a lock transition can never interleave with actor changes in the same signed batch.
+    error LockChangeMustBeStandalone();
+
+    /// @notice Defensive guard for an unhandled ChangeType in the apply loop. Unreachable in practice — out-of-range
+    ///         wire values are rejected by the enum decoder during ABI-decoding — but forces any future ChangeType to
+    ///         be dispatched explicitly instead of silently falling through.
+    error UnknownChangeType();
 
     /// @notice The auth blob is shorter than the 20-byte authenticator selector prefix.
     error InvalidAuthLength();
@@ -304,6 +352,7 @@ contract Keystore {
 
     /// @notice An actor config named an authenticator below the K1 sentinel (i.e. address(0)).
     error InvalidAuthenticator();
+
     /// @notice The policyData length did not match `scope & Scopes.POLICY` (52 bytes when set, empty when unset).
     error InvalidPolicyData();
 
@@ -329,9 +378,7 @@ contract Keystore {
     error BytecodeTooLarge();
 
     /// @notice createAccount was called with empty deployment bytecode.
-    /// @dev Zero-length runtime code would leave a Keystore-initialized address with no code. On 8130 chains that
-    ///      looks like an EOA that removed its EIP-7702 delegation, breaking the invariant
-    ///      isEOA = (7702-delegated) || (no code).
+    /// @dev Prevents creating a Keystore-initialized account with no runtime code.
     error EmptyBytecode();
 
     /// @notice CREATE2 did not deploy code at the expected account address (e.g. bytecode too large per EIP-170,
@@ -364,14 +411,18 @@ contract Keystore {
     /// @notice Modifier to check if an account is unlocked.
     /// @dev Reverts with AccountIsLocked when the account is locked.
     modifier onlyUnlocked(address account) {
-        if (_checkAndClearLock(account)) revert AccountIsLocked();
+        if (_isLocked(account)) {
+            revert AccountIsLocked();
+        }
         _;
     }
 
     /// @notice Modifier to check if an account is not the zero address.
     /// @dev Reverts with ZeroAccount when the account is the zero address.
     modifier nonZeroAccount(address account) {
-        if (account == address(0)) revert ZeroAccount();
+        if (account == address(0)) {
+            revert ZeroAccount();
+        }
         _;
     }
 
@@ -382,7 +433,7 @@ contract Keystore {
     /// @notice Deploys a new account with its initial actors. Each initial actor is registered with its declared
     ///         `scope` and, when `scope & Scopes.POLICY` is set, its `policyData` (an external `manager` is expressible
     ///         at create; `manager = account` is not, as the address is unknown at commitment time). `expiry` is
-    ///         always 0 at create — scoped-with-expiry keys are added afterwards via applySignedActorChanges. The
+    ///         always 0 at create — scoped-with-expiry keys are added afterwards via applySignedAccountChanges. The
     ///         implicit default-EOA key is disabled on creation.
     ///
     /// @dev Reverts with EmptyBytecode when `bytecode` is empty.
@@ -406,15 +457,15 @@ contract Keystore {
         bytes memory deploymentCode;
         (account, effectiveSalt, deploymentCode) = _prepareDeployment(userSalt, bytecode, initialActors);
 
-        // Block re-initialization of an already-bootstrapped account. This must be explicit: authorizeActor is now an
-        // upsert (no duplicate-actor revert) and the create2 below is intentionally swallowed (pop), so a duplicate
-        // createAccount would otherwise silently re-initialize.
-        if (_isInitialized(account)) revert AlreadyInitialized();
+        // Block re-initialization of an already-bootstrapped account. This must be explicit: authorizeActor is an
+        // upsert (no duplicate-actor revert), so without this guard a duplicate createAccount would re-run
+        // initialization over the existing actor set.
+        if (_isInitialized(account)) {
+            revert AlreadyInitialized();
+        }
 
-        // Mark initialized (localSequence = 1) and disable the implicit default-EOA path. A created account has code
-        // at its CREATE2 address, so the recovered==account owner path is unreachable; default it off (canonically
-        // ECDSA-owner-free / quantum-safe), folded into the same slot write. Set *before* initializing actors so a
-        // self-actorId k1 initial actor can re-enable the inline self (parity with import).
+        // Created accounts disable the implicit EOA key. Set this before actor initialization so an explicit k1 self
+        // actor can re-enable it.
         _accountState[account].localSequence = 1;
         _accountState[account].flags = FLAG_REVOKE_DEFAULT_EOA;
 
@@ -422,12 +473,15 @@ contract Keystore {
 
         // Deploy at the derived address. create2 returns address(0) on failure (EIP-170 size, EIP-3541 leading 0xEF,
         // or out of gas); reverting on mismatch unwinds every state write above, so a failed deploy can never leave
-        // an initialized-but-codeless account behind.
+        // an initialized-but-codeless account behind. Assembly is required because Solidity has no high-level
+        // equivalent for CREATE2 over arbitrary prepared initcode.
         address deployed;
         assembly ("memory-safe") {
             deployed := create2(0, add(deploymentCode, 0x20), mload(deploymentCode), effectiveSalt)
         }
-        if (deployed != account) revert AccountDeploymentFailed();
+        if (deployed != account) {
+            revert AccountDeploymentFailed();
+        }
         emit AccountCreated(account, userSalt, keccak256(bytecode));
     }
 
@@ -454,10 +508,14 @@ contract Keystore {
         InitialActor[] calldata initialActors,
         bytes calldata signature
     ) external onlyUnlocked(account) {
-        if (chainId != 0 && chainId != block.chainid) revert InvalidChainId();
+        if (chainId != 0 && chainId != block.chainid) {
+            revert InvalidChainId();
+        }
 
         // Import is a one-time bootstrap for accounts with no 8130 state yet.
-        if (_isInitialized(account)) revert AlreadyInitialized();
+        if (_isInitialized(account)) {
+            revert AlreadyInitialized();
+        }
         _accountState[account].localSequence = 1;
 
         bytes32 digest = _computeImportDigest(account, chainId, initialActors);
@@ -467,144 +525,236 @@ contract Keystore {
             revert InvalidImportSignature();
         }
 
-        // Disable the implicit default-EOA path (parity with createAccount). Set *after* the ERC-1271 check: for an
-        // EIP-7702 delegated EOA its own k1 signature (the implicit full owner) is the only authenticator available
-        // at import time, so it must stay live for that check. An owner who wants to keep using the key can include
-        // the self-actorId as an explicit k1 actor in initialActors (still a full owner, now via its config), or
-        // re-enable it later. Folds into the same slot as localSequence.
+        // Disable the implicit EOA key after ERC-1271 validation so a delegated EOA can use that key to authorize its
+        // import. Including the k1 self in initialActors re-enables it explicitly.
         _accountState[account].flags = FLAG_REVOKE_DEFAULT_EOA;
 
         _initializeAccount(account, initialActors);
         emit AccountImported(account);
     }
 
-    /// @notice Applies a batch of signed actor changes (authorize/revoke) to an account's configuration.
+    /// @notice The sole signed-change entry point: applies an ordered, atomic batch of account changes (authorize,
+    ///         revoke, increment-local-epoch, lock, unlock) authenticated by `s.signature`.
     ///
-    /// @dev Authenticates `auth` against the account's actors and requires the resolved actor to be unrestricted
-    ///      (scope 0) — there is no elevated scope for changing actors; admin is exactly scope == 0. Replay is
-    ///      bound by `chainId` (0 = multichain, else the current chain) and a monotonic per-account sequence
-    ///      consumed on each call.
-    /// @dev Reverts with AccountIsLocked when the account is locked.
-    /// @dev Reverts with InvalidChainId when `chainId` is neither 0 (multichain) nor the current chain.
-    /// @dev Reverts with InvalidAuthLength, InvalidSignature, AuthenticationFailed, AuthenticatorMismatch,
-    ///      ActorExpired, or DefaultEoaRevoked when `auth` fails to authenticate a live actor.
-    /// @dev Reverts with UnauthorizedActorChange when the authenticated actor is not unrestricted (scope != 0).
-    /// @dev Reverts with UnknownActorChangeType when a change carries an unrecognized changeType.
-    /// @dev Reverts with InvalidAuthenticator or InvalidPolicyData on a malformed authorize.
-    /// @dev Reverts with UnknownActor when revoking an actor that is not authorized.
+    /// @dev The governing axiom is Replay: a signed local change is valid only while it could still be validly
+    ///      applied — the committed local epoch must match and grants self-expire (`cfg.expiry > now`, unless
+    ///      `cfg.expiry == 0` which is the never-expiring sentinel).
+    ///
+    ///      Reduction is NOT contract-enforced. Removing authority durably (revoke, shorter expiry, narrower scope)
+    ///      requires retiring the signatures that granted it, which on the local channel means a {IncrementLocalEpoch};
+    ///      the contract lets a bare reduction land, so pairing it with an increment is a wallet responsibility. A bare
+    ///      revoke (or expiry cut) is not durable while a replayable unsequenced grant for that actor is outstanding.
+    ///
+    ///      Authorization is flat: every signed account change is admin-only, so a single up-front scope check
+    ///      (signer scope must be 0) authorizes the whole batch — there is no per-op authorization and no per-op
+    ///      sequencing restriction. IncrementLocalEpoch, Lock, and Unlock are Local-only; Lock and Unlock must also be
+    ///      standalone. Other ops may share a non-empty batch.
+    ///
+    ///      Pipeline (in order): (1) split the sequence word; (2) reject a stale epoch on Local batches;
+    ///      (3) validate/advance the sequence counter BEFORE apply (reentrancy discipline); (4) compute the digest
+    ///      via {_changesDigest}, authenticate, and reject a non-admin signer; (5) iterate
+    ///      changes enforcing channel and lock policy (local-only changes rejected on Multichain; authority ops
+    ///      rejected while the account is locked; Lock/Unlock must be standalone). Anyone may relay — authorization
+    ///      comes entirely from the signature.
     ///
     /// @param account The account whose configuration is changed.
-    /// @param chainId Replay domain: 0 = multichain (valid on every chain), otherwise the current chain.
-    /// @param actorChanges Ordered authorize/revoke operations to apply.
-    /// @param auth Authenticator(20) || authenticator-specific data authenticating an unrestricted actor.
-    function applySignedActorChanges(
-        address account,
-        uint256 chainId,
-        ActorChange[] calldata actorChanges,
-        bytes calldata auth
-    ) external onlyUnlocked(account) {
-        if (chainId != 0 && chainId != block.chainid) revert InvalidChainId();
+    /// @param s The signed batch (channel, ordered changes, sequence word, signature).
+    function applySignedAccountChanges(address account, SignedAccountChanges calldata s)
+        external
+        nonZeroAccount(account)
+    {
+        AccountState storage a = _accountState[account];
+        bool isLocal = s.channel == AccountChangeChannel.Local;
 
-        // Increment the corresponding sequence
-        uint64 sequence =
-            chainId == 0 ? _accountState[account].multichainSequence++ : _accountState[account].localSequence++;
+        // Reject an empty batch: a no-op signed change would otherwise consume a sequence (or initialize a fresh
+        // account, below) without altering any configuration.
+        if (s.changes.length == 0) {
+            revert EmptyChangeSet();
+        }
 
-        // Compute digest and authenticate
-        bytes32 digest = _computeSignedActorChangesDigest(account, chainId, sequence, actorChanges);
-        (, uint16 scope) = authenticateActor(account, digest, auth);
+        // Epoch / sequence gate. An unsequenced (JIT) batch exists only on the local channel (low half ==
+        // UNSEQUENCED) and does not consume a counter; every other batch consumes its channel's counter.
+        if (isLocal) {
+            uint32 epoch = uint32(s.sequence >> 32);
+            uint32 seq = uint32(s.sequence);
+            if (epoch != a.localEpoch) {
+                revert StaleEpoch();
+            }
+            if (seq != UNSEQUENCED) {
+                if (seq != a.localSequence) {
+                    revert BadSequence();
+                }
+                if (seq >= UNSEQUENCED - 1) {
+                    revert SequenceSaturated();
+                }
+                // Advance the local sequence before apply. A trailing IncrementLocalEpoch in the same batch
+                // overwrites this to 0, but that second write lands on an already-warm slot (~100 gas), so the
+                // combo isn't worth special-casing here.
+                a.localSequence = seq + 1;
+            } else if (!_isInitialized(account)) {
+                // Mark a fresh account initialized and invalidate outstanding sequence-0 signatures. The unsequenced
+                // batch remains replayable; failed authentication rolls this write back.
+                a.localSequence = 1;
+            }
+        } else {
+            // Multichain: a plain monotonic counter, never epoch-bearing or UNSEQUENCED.
+            uint64 seq = s.sequence;
+            if (seq != a.multichainSequence) {
+                revert BadSequence();
+            }
+            if (seq == type(uint64).max) {
+                revert SequenceSaturated();
+            }
+            a.multichainSequence = seq + 1;
+        }
 
-        // Only an unrestricted actor (scope 0) may change actors; there is no elevated "admin" scope bit.
-        if (scope != 0) revert UnauthorizedActorChange();
+        // Authenticate over the digest. Authorization is flat: every signed account change is
+        // admin-only, so a single scope check up front replaces any per-op authorization.
+        bytes32 digest = _changesDigest(account, s.channel, s.sequence, s.changes);
+        (, uint16 scope) = authenticateActor(account, digest, s.signature);
+        if (scope != 0) {
+            revert UnauthorizedAccountChange();
+        }
 
-        // Apply actorChanges. Out-of-range changeType values revert at ABI-decode, so only ActorChangeType.Invalid reaches
-        // the fall-through revert here.
-        for (uint256 i; i < actorChanges.length; i++) {
-            if (actorChanges[i].changeType == ActorChangeType.Authorize) {
-                (ActorConfig memory newActorConfig, bytes memory policyData) =
-                    abi.decode(actorChanges[i].data, (ActorConfig, bytes));
-                _authorizeActor(account, actorChanges[i].actorId, newActorConfig, policyData);
-            } else if (actorChanges[i].changeType == ActorChangeType.Revoke) {
-                _revokeActor(account, actorChanges[i].actorId);
+        // Authority ops use the lock state at batch entry. Local-only changes reject the Multichain channel; Lock and
+        // Unlock are also standalone. That standalone rule is what makes this entry snapshot EXACT for the whole batch:
+        // the only ops that mutate lock state (Lock/Unlock) can never share a batch with an authority op, so no op
+        // observes a lock state that a peer changed mid-loop. Relaxing standalone re-opens snapshot staleness — a later
+        // authority op could then run against a lock a Lock earlier in the same batch just set (or a stale-unlocked one).
+        bool locked = _isLocked(a);
+
+        uint256 n = s.changes.length;
+        for (uint256 i; i < n; i++) {
+            ChangeType t = s.changes[i].changeType;
+            if (t == ChangeType.AuthorizeActor) {
+                if (locked) {
+                    revert AccountIsLocked();
+                }
+                _applyAuthorize(account, s.changes[i].payload);
+            } else if (t == ChangeType.RevokeActor) {
+                if (locked) {
+                    revert AccountIsLocked();
+                }
+                _applyRevoke(account, s.changes[i].payload);
+            } else if (t == ChangeType.IncrementLocalEpoch) {
+                if (!isLocal) {
+                    revert ChangeRequiresLocalChannel();
+                }
+                _applyIncrementLocalEpoch(account, s.changes[i].payload);
+            } else if (t == ChangeType.Lock) {
+                if (!isLocal) {
+                    revert ChangeRequiresLocalChannel();
+                }
+                if (n != 1) {
+                    revert LockChangeMustBeStandalone();
+                }
+                _applyLock(account, s.changes[i].payload);
+            } else if (t == ChangeType.Unlock) {
+                if (!isLocal) {
+                    revert ChangeRequiresLocalChannel();
+                }
+                if (n != 1) {
+                    revert LockChangeMustBeStandalone();
+                }
+                _applyUnlock(account, s.changes[i].payload);
             } else {
-                revert UnknownActorChangeType();
+                // Defensive guard: every ChangeType must be dispatched explicitly. Unreachable today — out-of-range
+                // wire values are rejected by the enum decoder while ABI-decoding the calldata — so this forces any
+                // future ChangeType to be wired in here rather than silently falling through.
+                revert UnknownChangeType();
             }
         }
     }
 
     // ----------------------------------------------------------------------------------------------------------------
-    // ACCOUNT LOCKS
+    // SIGNED-CHANGE OP HANDLERS
     // ----------------------------------------------------------------------------------------------------------------
 
-    /// @notice Applies a signed lock-state change (hard-lock or initiate-unlock) to an account.
-    ///
-    /// @dev Lock state changes ONLY through this signed EVM entry point. Authorization comes entirely from the
-    ///      signature, so anyone may relay the call; the digest is authenticated against the account's actors and
-    ///      the resolved actor must be unrestricted (scope 0, admin) — there is no elevated scope for changing the
-    ///      lock. Lock changes are local-channel only: the digest binds `block.chainid` and a monotonic per-account
-    ///      `localSequence` consumed on each call (mirroring applySignedActorChanges so both signed entry points
-    ///      stay coherent on the same counter). Because both entry points share this counter, a pre-signed local
-    ///      actor change and a lock op contend for the same sequence: whichever is relayed first consumes it and
-    ///      invalidates the other until it is re-signed at the next sequence.
-    /// @dev op = LockChangeType.Lock (1): only from the unlocked state (reverts AccountIsLocked if currently locked). Sets
-    ///      FLAG_LOCKED and stores `unlockDelay` in `lockUnion`. Emits AccountLocked.
-    /// @dev op = LockChangeType.Unlock (2): only from the hard-locked state with no pending unlock (reverts NotLocked
-    ///      otherwise); `unlockDelay` MUST be 0. Sets FLAG_UNLOCK_INITIATED and overwrites `lockUnion` with
-    ///      unlocksAt = block.timestamp + storedDelay. Emits AccountUnlockInitiated.
-    /// @dev Reverts with InvalidAuthLength, InvalidSignature, AuthenticationFailed, AuthenticatorMismatch,
-    ///      ActorExpired, or DefaultEoaRevoked when `auth` fails to authenticate a live actor.
-    /// @dev Reverts with UnauthorizedLockChange when the authenticated actor is not unrestricted (scope != 0).
-    /// @dev Reverts with ZeroUnlockDelay when a lock op carries a zero unlock delay.
-    /// @dev Reverts with AccountIsLocked when a lock op targets an already-locked account.
-    /// @dev Reverts with InvalidUnlockDelay when an unlock op carries a non-zero unlock delay.
-    /// @dev Reverts with NotLocked when an unlock op targets an account that is not hard-locked.
-    /// @dev Reverts with UnknownLockChangeType when `op` is LockChangeType.Invalid.
-    ///
-    /// @param account The account whose lock state is changed.
-    /// @param op The lock operation: LockChangeType.Lock (1) to hard-lock, LockChangeType.Unlock (2) to initiate an unlock.
-    /// @param unlockDelay Delay in seconds before the account unlocks after an unlock is initiated (lock op only,
-    ///        max uint16, ~18 hours); MUST be 0 for the unlock op.
-    /// @param auth Authenticator(20) || authenticator-specific data authenticating an unrestricted actor.
-    function applySignedLockChanges(address account, LockChangeType op, uint16 unlockDelay, bytes calldata auth)
-        external
-    {
-        // Local channel only: bind the digest to the current chain and consume the local sequence (post-increment,
-        // hashing the pre-increment value — identical to applySignedActorChanges so both paths share one counter).
-        uint64 sequence = _accountState[account].localSequence++;
+    /// @dev AuthorizeActor. `payload = abi.encode(bytes32 actorId, ActorConfig cfg, bytes policyData)`; `cfg.expiry`
+    ///      is the granted expiry and the signature self-expires at it (or never, if `cfg.expiry == 0`). A plain
+    ///      upsert on both channels and both sequencing modes — the only gate is that a non-zero expiry be in the
+    ///      future. An unsequenced grant is replayable (it consumes no counter) and last-write-wins on its slot until
+    ///      the grant lapses or the epoch is incremented; durable reduction (revoke, shorter expiry, narrower scope) is
+    ///      therefore a wallet responsibility — batch the reducing op with a {IncrementLocalEpoch} to retire outstanding
+    ///      grants.
+    function _applyAuthorize(address account, bytes calldata payload) private {
+        (bytes32 actorId, ActorConfig memory cfg, bytes memory policyData) =
+            abi.decode(payload, (bytes32, ActorConfig, bytes));
 
-        bytes32 digest = _computeSignedLockChangesDigest(account, block.chainid, op, unlockDelay, sequence);
-        (, uint16 scope) = authenticateActor(account, digest, auth);
-
-        // Only an unrestricted actor (scope 0) may change the lock; there is no elevated "admin" scope bit.
-        if (scope != 0) revert UnauthorizedLockChange();
-
-        AccountState storage config = _accountState[account];
-
-        // Out-of-range op values revert at ABI-decode, so only LockChangeType.Invalid reaches the fall-through revert below.
-        if (op == LockChangeType.Lock) {
-            // Lock only from the unlocked state; lazily clear any elapsed unlock (also clears LOCKED) first.
-            if (_checkAndClearLock(account)) revert AccountIsLocked();
-            // Require non-zero unlock delay.
-            if (unlockDelay == 0) revert ZeroUnlockDelay();
-
-            // Post-clear the lock bits are clear, so set FLAG_LOCKED and stash the delay in the union.
-            config.flags |= FLAG_LOCKED;
-            config.lockUnion = unlockDelay;
-            emit AccountLocked(account, unlockDelay);
-        } else if (op == LockChangeType.Unlock) {
-            // The unlock op never sets the delay; it consumes the delay stored by the lock op.
-            if (unlockDelay != 0) revert InvalidUnlockDelay();
-            // Require the account is hard-locked (LOCKED set) with no unlock already initiated (UNLOCK_INITIATED clear).
-            uint8 flags = config.flags;
-            if (flags & FLAG_LOCKED == 0 || flags & FLAG_UNLOCK_INITIATED != 0) revert NotLocked();
-
-            // Reinterpret the union: it held the stored delay, now it holds the effective unlock timestamp.
-            uint48 unlocksAt = uint48(block.timestamp + uint16(config.lockUnion));
-            config.flags = flags | FLAG_UNLOCK_INITIATED;
-            config.lockUnion = unlocksAt;
-            emit AccountUnlockInitiated(account, unlocksAt);
-        } else {
-            revert UnknownLockChangeType();
+        // A grant must not be already-expired: reject a non-zero expiry that is not strictly in the future. A zero
+        // expiry is the canonical "no expiry" sentinel (unlimited, per {ActorConfig}) and is accepted.
+        if (cfg.expiry != 0 && cfg.expiry <= block.timestamp) {
+            revert ExpiredChange();
         }
+
+        _authorizeActor(account, actorId, cfg, policyData);
+    }
+
+    /// @dev RevokeActor. `payload = abi.encode(bytes32 actorId)`. Clears the actor's config and policy slots (and
+    ///      disables the inline k1 self for the self-actorId), emitting ActorRevoked; reverts UnknownActor if the
+    ///      actor is not currently live. Not durable against an outstanding replayable unsequenced grant for the same
+    ///      actorId (which would re-install into the emptied slot); batch a {IncrementLocalEpoch} for durable teardown.
+    function _applyRevoke(address account, bytes calldata payload) private {
+        bytes32 actorId = abi.decode(payload, (bytes32));
+        if (!_isAuthorized(account, actorId)) {
+            revert UnknownActor();
+        }
+        delete _actorConfig[actorId][account];
+        delete _policyCommitment[actorId][account];
+        delete _policyManager[actorId][account];
+        if (actorId == _selfActorId(account)) {
+            _disableInlineSelf(_accountState[account]);
+        }
+        emit ActorRevoked(account, actorId);
+    }
+
+    /// @dev IncrementLocalEpoch. Empty payload. Strict increment of the local epoch, resetting the local sequence to 0
+    ///      and thereby invalidating every unlanded local signature (they commit the full 64-bit word). Local-only.
+    function _applyIncrementLocalEpoch(address account, bytes calldata payload) private {
+        if (payload.length != 0) {
+            revert InvalidChangePayload();
+        }
+        AccountState storage a = _accountState[account];
+        // The epoch half has no reserved sentinel (unlike UNSEQUENCED on the sequence half), so the full uint32 range
+        // is usable: only the terminal value itself cannot advance.
+        if (a.localEpoch == type(uint32).max) {
+            revert EpochSaturated();
+        }
+        a.localEpoch += 1;
+        a.localSequence = 0;
+    }
+
+    /// @dev Lock. Local-only; `payload = abi.encode(uint16 unlockDelay)`. Must be standalone and requires the account
+    ///      to be currently unlocked. Overwrites any residue from an elapsed prior lock.
+    function _applyLock(address account, bytes calldata payload) private {
+        AccountState storage a = _accountState[account];
+        if (_isLocked(a)) {
+            revert AccountIsLocked();
+        }
+        uint16 unlockDelay = abi.decode(payload, (uint16));
+        if (unlockDelay == 0) {
+            revert ZeroUnlockDelay();
+        }
+        a.flags = (a.flags | FLAG_LOCKED) & ~FLAG_UNLOCK_INITIATED;
+        a.lockUnion = unlockDelay;
+        emit AccountLocked(account, unlockDelay);
+    }
+
+    /// @dev Unlock. Local-only; empty payload. Only from the hard-locked state with no pending unlock; sets the
+    ///      effective unlock timestamp from the stored delay.
+    function _applyUnlock(address account, bytes calldata payload) private {
+        if (payload.length != 0) {
+            revert InvalidChangePayload();
+        }
+        AccountState storage a = _accountState[account];
+        uint8 flags = a.flags;
+        if (flags & FLAG_LOCKED == 0 || flags & FLAG_UNLOCK_INITIATED != 0) {
+            revert NotLocked();
+        }
+        uint48 unlocksAt = uint48(block.timestamp + uint16(a.lockUnion));
+        a.flags = flags | FLAG_UNLOCK_INITIATED;
+        a.lockUnion = unlocksAt;
+        emit AccountUnlockInitiated(account, unlocksAt);
     }
 
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
@@ -630,12 +780,10 @@ contract Keystore {
     {
         // Authenticate against the account-scoped digest (see {replaySafeHash}), not the raw hash.
         try this.authenticateActor(account, replaySafeHash(account, hash), signature) returns (bytes32, uint16 scope) {
-            // ERC-1271 signing is authorized for any operational actor: the admin (scope == 0x00), or a SENDER actor
-            // that is not gated by a policy (Scopes.SENDER set AND Scopes.POLICY unset). Signing is an encoding of
-            // authority a SENDER actor already holds via calls, not a separate grant, so it needs no dedicated scope
-            // bit. A POLICY-bearing actor is not operational and cannot sign: a signature acts outside its policy
-            // gate, so honoring one would let it act off its gate.
-            return scope == 0 || ((scope & Scopes.SENDER != 0) && (scope & Scopes.POLICY == 0));
+            // ERC-1271 signing is authorized for any operational actor (see {Scopes.isOperator}): signing encodes
+            // authority a SENDER actor already holds via calls, so it needs no dedicated grant, while a POLICY-gated
+            // actor is not operational because a signature would act outside its policy gate.
+            return Scopes.isOperator(scope);
         } catch {
             return false;
         }
@@ -669,7 +817,7 @@ contract Keystore {
     }
 
     /// @dev EIP-712 domain separator for `account`'s ERC-1271 domain (verifyingContract = account, current chainId).
-    function _accountDomainSeparator(address account) internal view returns (bytes32) {
+    function _accountDomainSeparator(address account) private view returns (bytes32) {
         return keccak256(
             abi.encode(
                 _EIP712_DOMAIN_TYPEHASH, _ACCOUNT_DOMAIN_NAME_HASH, _ACCOUNT_DOMAIN_VERSION_HASH, block.chainid, account
@@ -703,7 +851,9 @@ contract Keystore {
         view
         returns (bytes32 actorId, uint16 scope)
     {
-        if (auth.length < 20) revert InvalidAuthLength();
+        if (auth.length < 20) {
+            revert InvalidAuthLength();
+        }
         return _authenticate(account, hash, address(bytes20(auth[:20])), auth[20:]);
     }
 
@@ -749,12 +899,16 @@ contract Keystore {
         // every stored authenticator is K1_AUTHENTICATOR (0x1) or a contract, so this is equivalent to != address(0).
         if (config.authenticator >= K1_AUTHENTICATOR) {
             // An expired stored actor reports as empty (as if never authorized), never its stale config.
-            if (_isExpired(config.expiry)) return _emptyActorConfig();
+            if (_isExpired(config.expiry)) {
+                return _emptyActorConfig();
+            }
             return config;
         }
-        if (actorId == bytes32(bytes20(account)) && !_isDefaultEoaRevoked(account)) {
+        if (actorId == _selfActorId(account) && !_isDefaultEoaRevoked(account)) {
             AccountState storage st = _accountState[account];
-            if (_isExpired(st.defaultEOAExpiry)) return _emptyActorConfig();
+            if (_isExpired(st.defaultEOAExpiry)) {
+                return _emptyActorConfig();
+            }
             return
                 ActorConfig({authenticator: K1_AUTHENTICATOR, scope: st.defaultEOAScope, expiry: st.defaultEOAExpiry});
         }
@@ -766,61 +920,56 @@ contract Keystore {
         return ActorConfig({authenticator: address(0), expiry: 0, scope: 0});
     }
 
-    /// @notice Resolves an actor's policy gate target (manager) and signed commitment.
+    /// @notice Returns an actor's stored policy manager and commitment.
     ///
-    /// @dev Convenience aggregator for off-chain consumers, equivalent to `(getPolicyManager, getPolicyCommitment)`.
-    ///      Enforcement is at execution: this resolves where a policy-gated actor may call and the commitment a
-    ///      target validates presented parameters against. The policy manager/commitment are keyed by actorId, so
-    ///      the inline k1 self and a non-k1 self share that keyspace; mutual exclusion guarantees at most one is
-    ///      live, so the active gate is read by actorId. Both slots are non-zero only when the actor's scope carries
-    ///      Scopes.POLICY (see _authorizeActor / _revokeActor); either MAY still be zero for an actor deliberately
-    ///      gated to a zero manager or a zero (no-params) commitment. On-chain consumers should prefer the
-    ///      single-SLOAD `getPolicyCommitment` / `getPolicyManager` accessors directly.
+    /// @dev Convenience aggregator for off-chain consumers. Returns raw slots even after actor expiry; authentication
+    ///      enforces expiry, while standalone readers should cross-check {getActorConfig}.
     ///
     /// @param account The account to read.
     /// @param actorId The actor identifier to resolve.
     ///
-    /// @return target The actor's policy gate target (manager), or address(0) if ungated.
-    /// @return commitment The actor's signed policy commitment, or bytes32(0) if ungated.
+    /// @return target The stored policy manager.
+    /// @return commitment The stored policy commitment.
     function getPolicy(address account, bytes32 actorId) external view returns (address target, bytes32 commitment) {
         return (_policyManager[actorId][account], _policyCommitment[actorId][account]);
     }
 
-    /// @notice Resolves an actor's signed policy commitment, or bytes32(0) if ungated / no actor / zero commitment.
+    /// @notice Returns an actor's stored policy commitment.
     ///
-    /// @dev Single SLOAD. Intended for a policy manager's per-tx validation read on the protocol-dispatched
-    ///      8130 tx path. This slot is non-zero only when the actor's scope carries Scopes.POLICY (see _authorizeActor /
-    ///      _revokeActor), but MAY be zero for a policy-gated actor with a zero (no-params) commitment; gating is
-    ///      therefore determined by the Scopes.POLICY bit, not by this slot being non-zero.
+    /// @dev Single SLOAD. Gating is determined by Scopes.POLICY, not by a non-zero commitment. Returns the raw slot
+    ///      after expiry; standalone readers should cross-check {getActorConfig}.
     ///
     /// @param account The account to read.
     /// @param actorId The actor identifier to resolve.
     ///
-    /// @return The signed policy commitment, or bytes32(0).
+    /// @return The stored policy commitment.
     function getPolicyCommitment(address account, bytes32 actorId) external view returns (bytes32) {
         return _policyCommitment[actorId][account];
     }
 
-    /// @notice Resolves an actor's policy gate target (manager), or address(0) if ungated or no actor.
+    /// @notice Returns an actor's stored policy manager.
     ///
-    /// @dev Single SLOAD. Same invariant as getPolicyCommitment.
+    /// @dev Single SLOAD. Returns the raw slot after expiry; standalone readers should cross-check {getActorConfig}.
     ///
     /// @param account The account to read.
     /// @param actorId The actor identifier to resolve.
     ///
-    /// @return The policy gate target (manager), or address(0) if ungated or no actor.
+    /// @return The stored policy manager.
     function getPolicyManager(address account, bytes32 actorId) external view returns (address) {
         return _policyManager[actorId][account];
     }
 
-    /// @notice Returns the account's multichain and local change sequences (replay counters).
+    /// @notice Returns the account's replay counters: the multichain counter and the local channel's epoch and
+    ///         sequence.
     ///
     /// @param account The account to read.
     ///
-    /// @return The account's ChangeSequences (multichain and local counters).
+    /// @return The account's ChangeSequences (multichain counter, local epoch, local sequence).
     function getChangeSequences(address account) external view returns (ChangeSequences memory) {
         AccountState storage state = _accountState[account];
-        return ChangeSequences({multichain: state.multichainSequence, local: state.localSequence});
+        return ChangeSequences({
+            multichain: state.multichainSequence, localEpoch: state.localEpoch, localSequence: state.localSequence
+        });
     }
 
     /// @notice Returns whether the account is currently locked (configuration frozen).
@@ -856,10 +1005,12 @@ contract Keystore {
             return (true, false, type(uint48).max, uint16(config.lockUnion));
         }
         // Unlock initiated: lockUnion holds the effective unlock timestamp. Once it has elapsed the account is
-        // effectively unlocked (storage is cleared lazily on the next onlyUnlocked op), so report the clean unlocked
-        // state — matching _checkAndClearLock's post-clear result — instead of surfacing the stale timestamp.
+        // effectively unlocked, so report the clean unlocked state instead of surfacing the stale timestamp. Storage is
+        // not canonicalized (lock reads are non-clearing); a later Lock overwrites the residue.
         uint48 unlockTime = config.lockUnion;
-        if (block.timestamp >= unlockTime) return (false, false, 0, 0);
+        if (block.timestamp >= unlockTime) {
+            return (false, false, 0, 0);
+        }
         return (true, true, unlockTime, 0);
     }
 
@@ -867,34 +1018,29 @@ contract Keystore {
     // INTERNAL FUNCTIONS
     // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
 
-    /// @notice Returns whether the account's configuration is currently frozen, WITHOUT mutating storage.
+    /// @dev Returns whether the account's configuration is currently frozen without mutating storage.
+    /// @dev An elapsed unlock reads as unlocked; a later {_applyLock} overwrites the stale lock fields.
     function _isLocked(AccountState storage st) private view returns (bool) {
         uint8 flags = st.flags;
-        if (flags & FLAG_LOCKED == 0) return false; // not locked
-        if (flags & FLAG_UNLOCK_INITIATED == 0) return true; // hard-locked
+        if (flags & FLAG_LOCKED == 0) {
+            return false;
+        }
+        if (flags & FLAG_UNLOCK_INITIATED == 0) {
+            return true;
+        }
         return block.timestamp < st.lockUnion; // pending unlock: frozen until the timestamp elapses
     }
 
-    /// @notice Returns true if the account is locked; lazily clears the lock flags/union once an initiated unlock has
-    ///         elapsed (the "cleared by the next op" rule).
-    function _checkAndClearLock(address account) internal returns (bool locked) {
-        AccountState storage st = _accountState[account];
-        if (_isLocked(st)) return true;
-        // Not locked, but FLAG_LOCKED still set means an initiated unlock has now elapsed: clear the lock bits and
-        // union so the account returns to a clean unlocked slot.
-        if (st.flags & FLAG_LOCKED != 0) {
-            st.flags &= ~(FLAG_LOCKED | FLAG_UNLOCK_INITIATED);
-            st.lockUnion = 0;
-        }
-        return false;
+    /// @dev Convenience overload of {_isLocked} keyed by address.
+    function _isLocked(address account) private view returns (bool) {
+        return _isLocked(_accountState[account]);
     }
 
-    /// @dev True once the account has been bootstrapped via createAccount or importAccount. localSequence doubles as
-    ///      the initialized flag (set to 1 at bootstrap); multichainSequence covers an account that established 8130
-    ///      state via a global (chainId 0) change.
+    /// @dev True after bootstrap or any successful signed change. The epoch and multichain counter keep initialization
+    ///      observable when the current local sequence is zero.
     function _isInitialized(address account) private view returns (bool) {
         AccountState storage st = _accountState[account];
-        return st.localSequence != 0 || st.multichainSequence != 0;
+        return st.localSequence != 0 || st.localEpoch != 0 || st.multichainSequence != 0;
     }
 
     // ----------------------------------------------------------------------------------------------------------------
@@ -904,19 +1050,23 @@ contract Keystore {
     /// @dev Registers the bootstrap actor set shared by createAccount and importAccount: requires a non-empty,
     ///      strictly ascending-by-actorId list (rejecting unsorted or duplicate entries) and authorizes each entry
     ///      with its declared scope and (when scope & Scopes.POLICY is set) policyData. Expiry is always 0 for
-    ///      initial actors; scoped-with-expiry keys are added later via applySignedActorChanges. Reverts with
+    ///      initial actors; scoped-with-expiry keys are added later via applySignedAccountChanges. Reverts with
     ///      NoInitialActors or ActorsNotSortedOrDuplicate.
     function _initializeAccount(address account, InitialActor[] calldata initialActors)
-        internal
+        private
         nonZeroAccount(account)
     {
         // Must have at least one initial actor
-        if (initialActors.length == 0) revert NoInitialActors();
+        if (initialActors.length == 0) {
+            revert NoInitialActors();
+        }
 
         bytes32 previousActorId;
         for (uint256 i; i < initialActors.length; i++) {
             // Enforce sorting with relative comparison of sequential actor ids
-            if (initialActors[i].actorId <= previousActorId) revert ActorsNotSortedOrDuplicate();
+            if (initialActors[i].actorId <= previousActorId) {
+                revert ActorsNotSortedOrDuplicate();
+            }
             previousActorId = initialActors[i].actorId;
 
             // Initial actors carry scope verbatim (0x00 = unrestricted admin) and never an expiry. When
@@ -931,23 +1081,30 @@ contract Keystore {
     /// @dev Authorizes (upserts) `actorId` with `config` and optional `policyData`, emitting ActorAuthorized. Rejects
     ///      a sub-K1 authenticator. The self-actorId is routed by authenticator type (a k1 self inline in
     ///      AccountState, a non-k1 self in _actorConfig) and the two are kept mutually exclusive; every other actor
-    ///      lives in _actorConfig. Reverts with InvalidAuthenticator or InvalidPolicyData.
+    ///      lives in _actorConfig. Reverts with InvalidActorId, InvalidAuthenticator, or InvalidPolicyData.
     function _authorizeActor(address account, bytes32 actorId, ActorConfig memory config, bytes memory policyData)
-        internal
+        private
         nonZeroAccount(account)
     {
+        // Zero is reserved for "no actor." Bootstrap also rejects it through the ascending-order check.
+        if (actorId == bytes32(0)) {
+            revert InvalidActorId();
+        }
+
         // Only reject the zero authenticator (the empty-slot sentinel). A non-zero authenticator with no code is
         // accepted deliberately: authenticators may be counterfactual (deployed later) and some are intentionally
         // codeless sentinels (e.g. EXTERNAL_POLICY_AUTHENTICATOR). A bad authenticator simply fails fail-closed at
         // authentication time, mirroring the reference PolicyManager's treatment of a zero-commitment policy actor.
-        if (config.authenticator < K1_AUTHENTICATOR) revert InvalidAuthenticator();
+        if (config.authenticator < K1_AUTHENTICATOR) {
+            revert InvalidAuthenticator();
+        }
 
         // Slice the signed policy by scope & Scopes.POLICY. The commitment is opaque to the protocol. This contract
         // does not reject scope combinations (e.g. Scopes.POLICY | Scopes.SELF_PAYER) — any use-time exclusivity between
         // Scopes.POLICY and the account's other capabilities is protocol-side, not enforced here.
         (address manager, bytes32 commitment) = _slicePolicy(config.scope, policyData);
 
-        if (actorId == bytes32(bytes20(account))) {
+        if (actorId == _selfActorId(account)) {
             // Self-actorId is routed by authenticator type and the two homes are mutually exclusive: the k1 self
             // lives inline in AccountState; a non-k1 self lives in _actorConfig. Authorizing one clears the
             // other so a k1 and a non-k1 self are never simultaneously live.
@@ -979,10 +1136,7 @@ contract Keystore {
         _emitActorAuthorized(account, actorId, config, manager, commitment);
     }
 
-    /// @dev Writes an actor's policy slots verbatim. `_slicePolicy` yields a zero manager/commitment for a non-policy
-    ///      scope, so an ungated actor simply zeroes the slots — a single unconditional write both installs a new gate
-    ///      and clears any stale one when an actor moves policy-gated -> ungated or re-keys to a different manager,
-    ///      preserving the "policy slots are non-zero iff scope & Scopes.POLICY != 0" invariant.
+    /// @dev Writes the current policy values and clears stale values when an actor becomes ungated.
     function _writePolicySlots(bytes32 actorId, address account, address manager, bytes32 commitment) private {
         _policyCommitment[actorId][account] = commitment;
         _policyManager[actorId][account] = manager;
@@ -1018,48 +1172,38 @@ contract Keystore {
     ///      params" and a zero manager gates the actor to address(0). Only a length mismatch reverts. The protocol
     ///      does not interpret the commitment value; self-enforcement is expressed as manager == account.
     function _slicePolicy(uint16 scope, bytes memory policyData)
-        internal
+        private
         pure
         returns (address manager, bytes32 commitment)
     {
         if (scope & Scopes.POLICY == 0) {
-            if (policyData.length != 0) revert InvalidPolicyData();
+            if (policyData.length != 0) {
+                revert InvalidPolicyData();
+            }
             return (address(0), bytes32(0));
         }
-        if (policyData.length != 52) revert InvalidPolicyData();
+        if (policyData.length != 52) {
+            revert InvalidPolicyData();
+        }
+        // The signed format is tightly packed to 52 bytes rather than ABI encoded to 64 bytes, so high-level
+        // abi.decode cannot parse it. This assembly performs the two fixed-offset reads without copying/repacking.
         assembly ("memory-safe") {
             manager := shr(96, mload(add(policyData, 0x20)))
             commitment := mload(add(policyData, 0x34))
         }
     }
 
-    /// @dev Returns whether `actorId` has an authorization entry on `account` (a stored actor config, or the inline
-    ///      k1 self is enabled), IGNORING expiry: an expired-but-not-revoked actor still returns true — intentional,
-    ///      since _revokeActor relies on it to revoke expired actors and reclaim their slots. Callers that want
-    ///      liveness (expiry-aware) read {getActorConfig} (authenticator != 0) instead.
+    /// @dev Checks authorization presence without expiry so expired actors can still be explicitly revoked.
     function _isAuthorized(address account, bytes32 actorId) private view returns (bool) {
-        // A populated _actorConfig entry is always live: any non-self actor, or a non-k1 self authenticator.
-        if (_actorConfig[actorId][account].authenticator >= K1_AUTHENTICATOR) return true;
-        // No _actorConfig entry: the self-actorId's k1 key lives inline in AccountState, live unless the flag is set.
-        if (actorId == bytes32(bytes20(account))) return !_isDefaultEoaRevoked(account);
-        return false;
-    }
-
-    /// @dev Revokes `actorId` from `account`, clearing its config and policy slots and emitting ActorRevoked. For the
-    ///      self-actorId it also disables the inline k1 self (sets FLAG_REVOKE_DEFAULT_EOA and zeroes the inline
-    ///      fields). Reverts with UnknownActor when the actor is not currently live.
-    function _revokeActor(address account, bytes32 actorId) internal nonZeroAccount(account) {
-        if (!_isAuthorized(account, actorId)) revert UnknownActor();
-        delete _actorConfig[actorId][account];
-        // Policy state is keyed by (account, actorId) and cleared exactly on revoke.
-        delete _policyCommitment[actorId][account];
-        delete _policyManager[actorId][account];
-        // For the self-actorId, disable the k1 self: set the flag (so the inline full-owner path stays off) and
-        // clear the inline config. Covers both homes — a non-k1 self was deleted above. Never auto-resurrected.
-        if (actorId == bytes32(bytes20(account))) {
-            _disableInlineSelf(_accountState[account]);
+        // A populated entry represents any non-self actor or a non-k1 self authenticator.
+        if (_actorConfig[actorId][account].authenticator >= K1_AUTHENTICATOR) {
+            return true;
         }
-        emit ActorRevoked(account, actorId);
+        // No _actorConfig entry: the self-actorId's k1 key lives inline in AccountState, live unless the flag is set.
+        if (actorId == _selfActorId(account)) {
+            return !_isDefaultEoaRevoked(account);
+        }
+        return false;
     }
 
     /// @dev Derives the CREATE2 inputs once for both {createAccount} and {computeAddress}: the effective salt, the
@@ -1081,7 +1225,7 @@ contract Keystore {
     ///      uses a tightly packed encoding that protocol clients can reproduce cheaply across chains:
     ///      effective_salt = keccak256(user_salt || actors_commitment).
     function _computeEffectiveSalt(bytes32 userSalt, InitialActor[] calldata initialActors)
-        internal
+        private
         pure
         returns (bytes32)
     {
@@ -1092,7 +1236,7 @@ contract Keystore {
     ///      actorId (32) || authenticator (20) || scope (2) || policyData, where policyData is empty (POLICY unset)
     ///      or exactly 52 bytes (POLICY set), so the length is unambiguous. Expiry does not participate (always 0
     ///      for initial actors).
-    function _computeActorsCommitment(InitialActor[] calldata initialActors) internal pure returns (bytes32) {
+    function _computeActorsCommitment(InitialActor[] calldata initialActors) private pure returns (bytes32) {
         bytes memory packed;
         for (uint256 i; i < initialActors.length; i++) {
             packed = abi.encodePacked(
@@ -1107,18 +1251,19 @@ contract Keystore {
     }
 
     /// @dev Typed digest for the importAccount ERC-1271 signature (a signed message), so signers can reproduce it
-    ///      with standard EIP-712-style struct hashing. `salt` is bound to the account address and the digest is
-    ///      bound to `chainId` (0 = multichain) so its replay domain matches applySignedActorChanges.
+    ///      with standard EIP-712-style struct hashing. `accountId` is the account's actorId
+    ///      (`ActorId.fromAddress(account)`) and the digest is bound to `chainId` (0 = multichain) so its replay
+    ///      domain matches applySignedAccountChanges.
     function _computeImportDigest(address account, uint256 chainId, InitialActor[] calldata initialActors)
-        internal
+        private
         pure
         returns (bytes32)
     {
         bytes32[] memory actorHashes = new bytes32[](initialActors.length);
         for (uint256 i; i < initialActors.length; i++) {
-            // Hash the actor's real scope. Expiry is always 0 at import — an actor-provided expiry is never
-            // accepted here. policyData is hashed via keccak256 into the Actor struct hash. The typehash structure
-            // matches the importAccount signature payload in EIP-8130.
+            // Expiry is forced to 0 at import — an actor-provided expiry is never accepted here. policyData is
+            // hashed via keccak256 into the Actor struct hash. The typehash structure matches the importAccount
+            // signature payload in EIP-8130.
             bytes32 configHash = keccak256(
                 abi.encode(ACTOR_CONFIG_TYPEHASH, initialActors[i].authenticator, uint48(0), initialActors[i].scope)
             );
@@ -1130,59 +1275,36 @@ contract Keystore {
         return keccak256(
             abi.encode(
                 ACTOR_INITIALIZATION_TYPEHASH,
-                bytes32(bytes20(account)),
+                ActorId.fromAddress(account),
                 chainId,
                 keccak256(abi.encodePacked(actorHashes))
             )
         );
     }
 
-    /// @dev Computes the digest signed over an applySignedActorChanges batch: each ActorChange is hashed structurally
-    ///      (its variable-length `data` pre-hashed to a fixed-width layout) and the batch is bound to `account`,
-    ///      `chainId`, and `sequence` via SIGNED_ACTOR_CHANGES_TYPEHASH.
-    function _computeSignedActorChangesDigest(
+    /// @dev Computes the digest signed over an applySignedAccountChanges batch: each AccountChange is hashed
+    ///      structurally (its variable-length `payload` pre-hashed to a fixed-width layout) and the batch is bound to
+    ///      `account`, the channel's replay `chainId` (0 for Multichain, block.chainid for Local), and the raw
+    ///      `sequence` word via SIGNED_ACCOUNT_CHANGES_TYPEHASH. The entire digest scheme is confined to this function
+    ///      so {applySignedAccountChanges} depends only on its output.
+    function _changesDigest(
         address account,
-        uint256 chainId,
+        AccountChangeChannel channel,
         uint64 sequence,
-        ActorChange[] calldata actorChanges
-    ) internal pure returns (bytes32) {
-        // Hash each actor change structurally: the variable-length `data` is hashed before encoding so the
-        // digest commits to a fixed-width layout (matches the ActorChange sub-type in SIGNED_ACTOR_CHANGES_TYPEHASH).
-        bytes32[] memory actorChangeHashes = new bytes32[](actorChanges.length);
-        for (uint256 i; i < actorChanges.length; i++) {
-            actorChangeHashes[i] = keccak256(
-                abi.encode(
-                    ACTOR_CHANGE_TYPEHASH,
-                    actorChanges[i].changeType,
-                    actorChanges[i].actorId,
-                    keccak256(actorChanges[i].data)
-                )
+        AccountChange[] calldata changes
+    ) private view returns (bytes32) {
+        uint256 chainId = channel == AccountChangeChannel.Multichain ? 0 : block.chainid;
+        bytes32[] memory changeHashes = new bytes32[](changes.length);
+        for (uint256 i; i < changes.length; i++) {
+            changeHashes[i] = keccak256(
+                abi.encode(ACCOUNT_CHANGE_TYPEHASH, uint8(changes[i].changeType), keccak256(changes[i].payload))
             );
         }
-
-        // Hash the batch of actor changes
         return keccak256(
             abi.encode(
-                SIGNED_ACTOR_CHANGES_TYPEHASH,
-                account,
-                chainId,
-                sequence,
-                keccak256(abi.encodePacked(actorChangeHashes))
+                SIGNED_ACCOUNT_CHANGES_TYPEHASH, account, chainId, sequence, keccak256(abi.encodePacked(changeHashes))
             )
         );
-    }
-
-    /// @dev Computes the digest signed over an applySignedLockChanges call, binding the lock op and its unlock delay
-    ///      to `account`, `chainId`, and `sequence` via LOCK_CHANGE_TYPEHASH. Lock changes are local-channel only,
-    ///      so callers always pass the current chainId.
-    function _computeSignedLockChangesDigest(
-        address account,
-        uint256 chainId,
-        LockChangeType op,
-        uint16 unlockDelay,
-        uint64 sequence
-    ) internal pure returns (bytes32) {
-        return keccak256(abi.encode(LOCK_CHANGE_TYPEHASH, account, chainId, op, unlockDelay, sequence));
     }
 
     // ----------------------------------------------------------------------------------------------------------------
@@ -1194,14 +1316,18 @@ contract Keystore {
     ///      IAuthenticator and requires the resolved actorId to carry a matching, unexpired _actorConfig entry.
     ///      Reverts with AuthenticationFailed, AuthenticatorMismatch, or ActorExpired.
     function _authenticate(address account, bytes32 hash, address authenticator, bytes calldata data)
-        internal
+        private
         view
         returns (bytes32, uint16)
     {
-        if (authenticator == K1_AUTHENTICATOR) return _authenticateK1(account, hash, data);
+        if (authenticator == K1_AUTHENTICATOR) {
+            return _authenticateK1(account, hash, data);
+        }
 
         bytes32 actorId = IAuthenticator(authenticator).authenticate(hash, data);
-        if (actorId == bytes32(0)) revert AuthenticationFailed();
+        if (actorId == bytes32(0)) {
+            revert AuthenticationFailed();
+        }
 
         return (actorId, _resolveExplicitActor(account, actorId, authenticator));
     }
@@ -1215,9 +1341,13 @@ contract Keystore {
         returns (uint16 scope)
     {
         ActorConfig memory config = _actorConfig[actorId][account];
-        if (config.authenticator != expectedAuthenticator) revert AuthenticatorMismatch();
+        if (config.authenticator != expectedAuthenticator) {
+            revert AuthenticatorMismatch();
+        }
         // Expiry is read from the same slot; an expired actor fails authentication. 0 = no expiry.
-        if (_isExpired(config.expiry)) revert ActorExpired();
+        if (_isExpired(config.expiry)) {
+            revert ActorExpired();
+        }
         scope = config.scope;
     }
 
@@ -1229,48 +1359,66 @@ contract Keystore {
     ///        - otherwise the signer's actorId must carry an explicit K1 config in _actorConfig (any other k1 actor).
     ///      Both the common self and other-actor paths cost a single SLOAD.
     function _authenticateK1(address account, bytes32 hash, bytes calldata data)
-        internal
+        private
         view
         returns (bytes32, uint16)
     {
         address recovered = _recoverSigner(hash, data);
-        if (recovered == address(0)) revert InvalidSignature();
+        if (recovered == address(0)) {
+            revert InvalidSignature();
+        }
 
         if (recovered == account) {
             // Inline self: a single SLOAD resolves the whole key. The flag disables it entirely; otherwise the
             // inline scope/expiry govern (all-zero = full owner).
             AccountState storage st = _accountState[account];
-            if (st.flags & FLAG_REVOKE_DEFAULT_EOA != 0) revert DefaultEoaRevoked();
-            if (_isExpired(st.defaultEOAExpiry)) revert ActorExpired();
-            return (bytes32(bytes20(account)), st.defaultEOAScope);
+            if (st.flags & FLAG_REVOKE_DEFAULT_EOA != 0) {
+                revert DefaultEoaRevoked();
+            }
+            if (_isExpired(st.defaultEOAExpiry)) {
+                revert ActorExpired();
+            }
+            return (_selfActorId(account), st.defaultEOAScope);
         }
 
-        bytes32 actorId = bytes32(bytes20(recovered));
+        bytes32 actorId = ActorId.fromAddress(recovered);
         return (actorId, _resolveExplicitActor(account, actorId, K1_AUTHENTICATOR));
     }
 
     /// @dev True if the account's default (implicit) EOA has been revoked via the AccountState flag.
-    function _isDefaultEoaRevoked(address account) internal view returns (bool) {
+    function _isDefaultEoaRevoked(address account) private view returns (bool) {
         return _accountState[account].flags & FLAG_REVOKE_DEFAULT_EOA != 0;
     }
 
+    /// @dev The account's implicit self-actorId (`ActorId.fromAddress`), matching the normative self derivation.
+    ///      Non-zero for any valid account.
+    function _selfActorId(address account) private pure returns (bytes32) {
+        return ActorId.fromAddress(account);
+    }
+
     /// @dev True when `expiry` is set (non-zero) and has passed. A zero expiry means no expiry.
-    function _isExpired(uint48 expiry) internal view returns (bool) {
+    function _isExpired(uint48 expiry) private view returns (bool) {
         return expiry != 0 && block.timestamp > expiry;
     }
 
     /// @dev Recovers the ECDSA signer from a 65-byte r‖s‖v signature over `hash`, enforcing EIP-2 (low-s only,
     ///      canonical v of 27 or 28). Reverts with InvalidSignature on a bad length or non-canonical encoding; may
     ///      return address(0) if ecrecover fails, which callers treat as a failed authentication.
-    function _recoverSigner(bytes32 hash, bytes calldata data) internal pure returns (address recovered) {
-        if (data.length != 65) revert InvalidSignature();
+    function _recoverSigner(bytes32 hash, bytes calldata data) private pure returns (address recovered) {
+        if (data.length != 65) {
+            revert InvalidSignature();
+        }
         bytes32 r = bytes32(data[:32]);
         bytes32 s = bytes32(data[32:64]);
         uint8 v = uint8(data[64]);
         // EIP-2: reject the malleable high-s half of each signature and non-canonical v to enforce a single
         // canonical encoding per signature.
-        if (uint256(s) > SECP256K1_HALF_ORDER) revert InvalidSignature();
-        if (v != 27 && v != 28) revert InvalidSignature();
+        if (uint256(s) > SECP256K1_HALF_ORDER) {
+            revert InvalidSignature();
+        }
+        if (v != 27 && v != 28) {
+            revert InvalidSignature();
+        }
         return ecrecover(hash, v, r, s);
     }
 
@@ -1278,15 +1426,18 @@ contract Keystore {
     // ACCOUNT CREATION
     // ----------------------------------------------------------------------------------------------------------------
 
-    /// @notice Constructs the deployment code for an account in a manner that doesn't immediately run constructor code.
-    /// @dev Returns a 14-byte EVM loader followed by `bytecode`. Reverts {EmptyBytecode} when `bytecode` is empty.
+    /// @dev Constructs a 14-byte EVM loader followed by `bytecode`. Reverts {EmptyBytecode} when `bytecode` is empty.
     ///      The loader copies the trailing `bytecode` into memory and returns it as the deployed runtime:
     ///        PUSH2 n; PUSH1 0x0e; PUSH1 0x00; CODECOPY   // copy n bytes from code offset 14 to mem 0
     ///        PUSH2 n; PUSH1 0x00; RETURN                 // return mem[0..n]
-    function _buildDeploymentCode(bytes calldata bytecode) internal pure returns (bytes memory) {
+    function _buildDeploymentCode(bytes calldata bytecode) private pure returns (bytes memory) {
         uint256 n = bytecode.length;
-        if (n == 0) revert EmptyBytecode();
-        if (n > 0xFFFF) revert BytecodeTooLarge();
+        if (n == 0) {
+            revert EmptyBytecode();
+        }
+        if (n > 0xFFFF) {
+            revert BytecodeTooLarge();
+        }
         return abi.encodePacked(
             bytes1(0x61), bytes2(uint16(n)), hex"600e600039", bytes1(0x61), bytes2(uint16(n)), hex"6000f3", bytecode
         );
