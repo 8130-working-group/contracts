@@ -18,7 +18,7 @@ import {SessionPolicy} from "../src/policies/SessionPolicy.sol";
 ///      https://github.com/Arachnid/deterministic-deployment-proxy
 address constant CREATE2_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
-bytes32 constant SALT = bytes32(0);
+bytes32 constant SALT = 0x9ebf94ba0542294d476fdb51aaca1c0bc14abb832ef7f4bb28363bb56a2c4082;
 
 /// @notice Deploys the full EIP-8130 system: Keystore, account implementations, canonical
 ///         authenticators, and the unaudited example policy contracts (PolicyManager, SessionPolicy).
