@@ -18,7 +18,24 @@ import {SessionPolicy} from "../src/policies/SessionPolicy.sol";
 ///      https://github.com/Arachnid/deterministic-deployment-proxy
 address constant CREATE2_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
-bytes32 constant SALT = 0x9ebf94ba0542294d476fdb51aaca1c0bc14abb832ef7f4bb28363bb56a2c4082;
+bytes32 constant DEFAULT_SALT = bytes32(0);
+
+/// @dev Keystore: 0x8130...00ac
+bytes32 constant KEYSTORE_SALT = 0x045e2227e02fc8186ffea7c1615cc938f95b1409822ae709bf01391c77ce4c31;
+/// @dev DefaultAccount: 0x8130...adef
+bytes32 constant DEFAULT_ACCOUNT_SALT = 0x00000000000000000000000000000000000000000000000000000000726c5776;
+/// @dev CanonicalHighRatePayerAccount: 0x8130...fa57
+bytes32 constant HIGH_RATE_PAYER_SALT = 0x00000000000000000000000000000000000000000000000000000000e1082fa1;
+/// @dev P256Authenticator: 0x8130...a256
+bytes32 constant P256_SALT = 0x000000000000000000000000000000000000000000000000000000014139e07b;
+/// @dev WebAuthnAuthenticator: 0x8130...f1d0
+bytes32 constant WEBAUTHN_SALT = 0x000000000000000000000000000000000000000000000000000000015ec496a4;
+/// @dev DelegateAuthenticator: 0x8130...ade1
+bytes32 constant DELEGATE_SALT = 0x0000000000000000000000000000000000000000000000000000000039225d35;
+/// @dev PolicyManager: 0x8130...0ac1
+bytes32 constant POLICY_MANAGER_SALT = 0x0000000000000000000000000000000000000000000000000000000075ae4f93;
+/// @dev SessionPolicy: 0x8130...5e55
+bytes32 constant SESSION_POLICY_SALT = 0x000000000000000000000000000000000000000000000000000000006125f207;
 
 /// @notice Deploys the full EIP-8130 system: Keystore, account implementations, canonical
 ///         authenticators, and the unaudited example policy contracts (PolicyManager, SessionPolicy).
@@ -52,20 +69,20 @@ contract Deploy is Script {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// @dev Computes the canonical CREATE2 address for the given init code.
-    function _addr(bytes memory initCode) internal pure returns (address) {
+    /// @dev Computes the canonical CREATE2 address for the given init code and salt.
+    function _addr(bytes memory initCode, bytes32 salt) internal pure returns (address) {
         return address(
-            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_FACTORY, SALT, keccak256(initCode)))))
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_FACTORY, salt, keccak256(initCode)))))
         );
     }
 
     /// @dev Deploys initCode through the singleton CREATE2 factory.
     ///      Idempotent: if the contract is already deployed the call is skipped
     ///      and the pre-existing address is returned.
-    function _create2(bytes memory initCode) internal returns (address addr) {
-        addr = _addr(initCode);
+    function _create2(bytes memory initCode, bytes32 salt) internal returns (address addr) {
+        addr = _addr(initCode, salt);
         if (addr.code.length > 0) return addr;
-        (bool ok,) = CREATE2_FACTORY.call(abi.encodePacked(SALT, initCode));
+        (bool ok,) = CREATE2_FACTORY.call(abi.encodePacked(salt, initCode));
         require(ok && addr.code.length > 0, "create2 deployment failed");
     }
 
@@ -120,29 +137,29 @@ contract Deploy is Script {
 
     /// @notice Logs the canonical address of every contract in the system, plus the ERC-1167 runtime
     ///         bytecode nodes must match for CanonicalHighRatePayerAccount clones.
-    ///         Addresses depend only on the compiler output and SALT — they are
+    ///         Addresses depend only on the compiler output and deployment salts — they are
     ///         the same on every chain and are known before deployment.
     function addresses() public pure {
-        address accountConfig = _addr(_accountConfigInit());
-        address canonicalHighRatePayer = _addr(_canonicalHighRatePayerInit(accountConfig));
-        address policyManager = _addr(_policyManagerInit(accountConfig));
+        address accountConfig = _addr(_accountConfigInit(), KEYSTORE_SALT);
+        address canonicalHighRatePayer = _addr(_canonicalHighRatePayerInit(accountConfig), HIGH_RATE_PAYER_SALT);
+        address policyManager = _addr(_policyManagerInit(accountConfig), POLICY_MANAGER_SALT);
 
         console.log("Keystore:    ", accountConfig);
         console.log("");
         console.log("=== Account implementations ===");
-        console.log("DefaultAccount:          ", _addr(_defaultAccountInit(accountConfig)));
+        console.log("DefaultAccount:          ", _addr(_defaultAccountInit(accountConfig), DEFAULT_ACCOUNT_SALT));
         console.log("CanonicalHighRatePayerAccount:", canonicalHighRatePayer);
         console.log("");
         console.log("=== Authenticators ===");
         console.log("(secp256k1 is built in: Keystore.K1_AUTHENTICATOR() == address(1))");
-        console.log("P256Authenticator:       ", _addr(type(P256Authenticator).creationCode));
-        console.log("WebAuthnAuthenticator:   ", _addr(type(WebAuthnAuthenticator).creationCode));
-        console.log("DelegateAuthenticator:   ", _addr(_delegateAuthInit(accountConfig)));
-        console.log("AlwaysValidAuthenticator:", _addr(type(AlwaysValidAuthenticator).creationCode));
+        console.log("P256Authenticator:       ", _addr(type(P256Authenticator).creationCode, P256_SALT));
+        console.log("WebAuthnAuthenticator:   ", _addr(type(WebAuthnAuthenticator).creationCode, WEBAUTHN_SALT));
+        console.log("DelegateAuthenticator:   ", _addr(_delegateAuthInit(accountConfig), DELEGATE_SALT));
+        console.log("AlwaysValidAuthenticator:", _addr(type(AlwaysValidAuthenticator).creationCode, DEFAULT_SALT));
         console.log("");
         console.log("=== Example policies (unaudited) ===");
         console.log("PolicyManager:           ", policyManager);
-        console.log("SessionPolicy:           ", _addr(_sessionPolicyInit(policyManager)));
+        console.log("SessionPolicy:           ", _addr(_sessionPolicyInit(policyManager), SESSION_POLICY_SALT));
 
         _logHighRatePayerMatchBytecode(canonicalHighRatePayer);
     }
@@ -156,26 +173,26 @@ contract Deploy is Script {
 
         // ── Core system contract ──
 
-        address accountConfig = _create2(_accountConfigInit());
+        address accountConfig = _create2(_accountConfigInit(), KEYSTORE_SALT);
 
         // ── Account implementations (singletons; every account proxy — and every 7702 EOA — delegates to one) ──
         //    DefaultAccount is deployed standalone as the direct EIP-7702 delegation target for EOAs.
         //    CanonicalHighRatePayerAccount is the ERC-1167 high-rate payer implementation singleton.
 
-        address defaultAccount = _create2(_defaultAccountInit(accountConfig));
-        address canonicalHighRatePayer = _create2(_canonicalHighRatePayerInit(accountConfig));
+        address defaultAccount = _create2(_defaultAccountInit(accountConfig), DEFAULT_ACCOUNT_SALT);
+        address canonicalHighRatePayer = _create2(_canonicalHighRatePayerInit(accountConfig), HIGH_RATE_PAYER_SALT);
 
         // ── Authenticators (secp256k1 is built into Keystore; no contract to deploy) ──
 
-        address p256 = _create2(type(P256Authenticator).creationCode);
-        address webAuthn = _create2(type(WebAuthnAuthenticator).creationCode);
-        address delegate = _create2(_delegateAuthInit(accountConfig));
-        address alwaysValid = _create2(type(AlwaysValidAuthenticator).creationCode);
+        address p256 = _create2(type(P256Authenticator).creationCode, P256_SALT);
+        address webAuthn = _create2(type(WebAuthnAuthenticator).creationCode, WEBAUTHN_SALT);
+        address delegate = _create2(_delegateAuthInit(accountConfig), DELEGATE_SALT);
+        address alwaysValid = _create2(type(AlwaysValidAuthenticator).creationCode, DEFAULT_SALT);
 
         // ── Example policies (unaudited reference implementations) ──
 
-        address policyManager = _create2(_policyManagerInit(accountConfig));
-        address sessionPolicy = _create2(_sessionPolicyInit(policyManager));
+        address policyManager = _create2(_policyManagerInit(accountConfig), POLICY_MANAGER_SALT);
+        address sessionPolicy = _create2(_sessionPolicyInit(policyManager), SESSION_POLICY_SALT);
 
         vm.stopBroadcast();
 
