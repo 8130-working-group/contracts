@@ -9,7 +9,6 @@ import {CanonicalHighRatePayerAccount} from "../src/accounts/CanonicalHighRatePa
 import {P256Authenticator} from "../src/authenticators/P256Authenticator.sol";
 import {WebAuthnAuthenticator} from "../src/authenticators/WebAuthnAuthenticator.sol";
 import {DelegateAuthenticator} from "../src/authenticators/DelegateAuthenticator.sol";
-import {AlwaysValidAuthenticator} from "../src/authenticators/AlwaysValidAuthenticator.sol";
 import {PolicyManager} from "../src/policies/PolicyManager.sol";
 import {SessionPolicy} from "../src/policies/SessionPolicy.sol";
 
@@ -155,7 +154,6 @@ contract Deploy is Script {
         console.log("P256Authenticator:       ", _addr(type(P256Authenticator).creationCode, P256_SALT));
         console.log("WebAuthnAuthenticator:   ", _addr(type(WebAuthnAuthenticator).creationCode, WEBAUTHN_SALT));
         console.log("DelegateAuthenticator:   ", _addr(_delegateAuthInit(accountConfig), DELEGATE_SALT));
-        console.log("AlwaysValidAuthenticator:", _addr(type(AlwaysValidAuthenticator).creationCode, DEFAULT_SALT));
         console.log("");
         console.log("=== Example policies (unaudited) ===");
         console.log("PolicyManager:           ", policyManager);
@@ -187,7 +185,6 @@ contract Deploy is Script {
         address p256 = _create2(type(P256Authenticator).creationCode, P256_SALT);
         address webAuthn = _create2(type(WebAuthnAuthenticator).creationCode, WEBAUTHN_SALT);
         address delegate = _create2(_delegateAuthInit(accountConfig), DELEGATE_SALT);
-        address alwaysValid = _create2(type(AlwaysValidAuthenticator).creationCode, DEFAULT_SALT);
 
         // ── Example policies (unaudited reference implementations) ──
 
@@ -207,7 +204,6 @@ contract Deploy is Script {
         console.log("P256Authenticator:       ", p256);
         console.log("WebAuthnAuthenticator:   ", webAuthn);
         console.log("DelegateAuthenticator:   ", delegate);
-        console.log("AlwaysValidAuthenticator:", alwaysValid);
         console.log("");
         console.log("=== Example policies (unaudited) ===");
         console.log("PolicyManager:           ", policyManager);

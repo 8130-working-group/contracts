@@ -28,7 +28,7 @@ Every account is a small per-account proxy (deployed at a deterministic CREATE2 
 
 ### Authenticators
 
-The canonical EIP-8130 authenticator set. secp256k1 (ECDSA) is built into `Keystore` as `K1_AUTHENTICATOR` (`address(1)`, native `ecrecover`) — it is the single path for the default EOA and every k1 actor, so there is no standalone contract to deploy. `AlwaysValidAuthenticator` is an example/test helper, not a canonical authenticator.
+The canonical EIP-8130 authenticator set. secp256k1 (ECDSA) is built into `Keystore` as `K1_AUTHENTICATOR` (`address(1)`, native `ecrecover`) — it is the single path for the default EOA and every k1 actor, so there is no standalone contract to deploy.
 
 | Contract | Algorithm |
 |----------|-----------|
@@ -36,7 +36,6 @@ The canonical EIP-8130 authenticator set. secp256k1 (ECDSA) is built into `Keyst
 | `P256Authenticator` | secp256r1 / P-256 (raw) |
 | `WebAuthnAuthenticator` | secp256r1 / P-256 (WebAuthn) |
 | `DelegateAuthenticator` | Delegated validation (1-hop) |
-| `AlwaysValidAuthenticator` | Always valid — keyless relay (example/testing only) |
 
 ## Usage
 
