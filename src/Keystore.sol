@@ -41,14 +41,6 @@ contract Keystore {
         bytes policyData; // empty unless scope & Scopes.POLICY; then manager(20) || commitment(32)
     }
 
-    /// @notice A full actor record: identifier, config, and policy data.
-    struct Actor {
-        bytes32 actorId;
-        ActorConfig config;
-        // Sliced by scope: empty when scope & Scopes.POLICY == 0; manager[20] || commitment[32] when set.
-        bytes policyData;
-    }
-
     /// @notice The operation an {AccountChange} applies within an {applySignedAccountChanges} batch.
     ///
     /// @dev ABI-encodes as uint8. Authority ops (AuthorizeActor, RevokeActor) are rejected while locked. Environment
@@ -912,37 +904,56 @@ contract Keystore {
     // STORAGE VIEWS
     // ----------------------------------------------------------------------------------------------------------------
 
-    /// @notice Resolves the effective ActorConfig for `actorId` on `account`.
-    ///
-    /// @dev With a populated _actorConfig entry, returns it verbatim (any non-self actor, or a non-k1 self). For the
-    ///      self-actorId without such an entry, the k1 self lives inline in AccountState: a live one (flag unset)
-    ///      reports as a native ecrecover owner carrying its inline scope/expiry (all-zero = full owner); a
-    ///      disabled one, or any unknown actor, reports as the all-zero (empty) config, keeping live-vs-disabled
-    ///      unambiguous without a sentinel.
-    ///
-    /// @param account The account to read.
-    /// @param actorId The actor identifier to resolve.
-    ///
-    /// @return The resolved actor configuration, or the all-zero config if the actor is not live (unknown, disabled,
-    ///         or expired).
+    /// @notice The liveness-gated {ActorConfig} for `actorId` — the all-zero config when the actor is not live
+    ///         (unknown, revoked, disabled, or expired). See {_resolveActorConfig}.
     function getActorConfig(address account, bytes32 actorId) external view returns (ActorConfig memory) {
-        ActorConfig memory config = _actorConfig[actorId][account];
-        // Non-zero authenticator = a stored entry. Uses the same `>= K1_AUTHENTICATOR` namespace idiom as _isAuthorized:
-        // every stored authenticator is K1_AUTHENTICATOR (0x1) or a contract, so this is equivalent to != address(0).
-        if (config.authenticator >= K1_AUTHENTICATOR) {
-            // An expired stored actor reports as empty (as if never authorized), never its stale config.
-            if (_isExpired(config.expiry)) {
-                return _emptyActorConfig();
-            }
-            return config;
+        return _resolveActorConfig(account, actorId);
+    }
+
+    /// @notice Returns an actor's config, policy manager, and policy commitment in one read. The manager and
+    ///         commitment are non-zero only for a live actor with scope & Scopes.POLICY set; a non-live actor
+    ///         returns the empty config and a zero manager/commitment.
+    function getActor(address account, bytes32 actorId)
+        external
+        view
+        returns (ActorConfig memory config, address policyManager, bytes32 policyCommitment)
+    {
+        config = _resolveActorConfig(account, actorId);
+        // Gating is by the scope bit, matching {_emitActorAuthorized}; a non-live or ungated actor has a zero gate.
+        if (config.authenticator != address(0) && config.scope & Scopes.POLICY != 0) {
+            policyManager = _policyManager[actorId][account];
+            policyCommitment = _policyCommitment[actorId][account];
         }
-        if (actorId == _selfActorId(account) && !_isDefaultEoaRevoked(account)) {
+    }
+
+    /// @dev The single liveness resolver behind every read surface ({getActorConfig}, {getActor},
+    ///      {getPolicyCommitment}, {getPolicyManager}). A populated _actorConfig entry returns verbatim unless expired;
+    ///      the k1 self (inline in AccountState) resolves to a native ecrecover owner unless disabled or expired;
+    ///      anything unknown/revoked/disabled/expired resolves to the all-zero (empty) config. Centralizing this is
+    ///      what makes "expired" read identically to "revoked" on every surface — the invariant that lets a node
+    ///      garbage-collect an expired actor's slots without changing anything observable on-chain.
+    function _resolveActorConfig(address account, bytes32 actorId) private view returns (ActorConfig memory) {
+        // Common path first: the inline k1 self. A clear FLAG_REVOKE_DEFAULT_EOA means the inline self is live, so
+        // resolve it from AccountState alone (all-zero = full owner). When the flag is set the inline self is off —
+        // either a non-k1 self lives in _actorConfig, or the self was revoked — so fall through to the shared home.
+        if (actorId == _selfActorId(account)) {
             AccountState storage st = _accountState[account];
-            if (_isExpired(st.defaultEOAExpiry)) {
-                return _emptyActorConfig();
+            if (st.flags & FLAG_REVOKE_DEFAULT_EOA == 0) {
+                if (_isExpired(st.defaultEOAExpiry)) {
+                    return _emptyActorConfig();
+                }
+                return
+                    ActorConfig({
+                        authenticator: K1_AUTHENTICATOR, scope: st.defaultEOAScope, expiry: st.defaultEOAExpiry
+                    });
             }
-            return
-                ActorConfig({authenticator: K1_AUTHENTICATOR, scope: st.defaultEOAScope, expiry: st.defaultEOAExpiry});
+        }
+
+        // Explicit actor (or a non-k1 self): the single _actorConfig home. A stored authenticator is K1_AUTHENTICATOR
+        // (0x1) or a contract, so `>= K1_AUTHENTICATOR` is the "slot populated" test. An expired entry reports empty.
+        ActorConfig memory config = _actorConfig[actorId][account];
+        if (config.authenticator >= K1_AUTHENTICATOR) {
+            return _isExpired(config.expiry) ? _emptyActorConfig() : config;
         }
         return config;
     }
@@ -952,42 +963,20 @@ contract Keystore {
         return ActorConfig({authenticator: address(0), expiry: 0, scope: 0});
     }
 
-    /// @notice Returns an actor's stored policy manager and commitment.
-    ///
-    /// @dev Convenience aggregator for off-chain consumers. Returns raw slots even after actor expiry; authentication
-    ///      enforces expiry, while standalone readers should cross-check {getActorConfig}.
-    ///
-    /// @param account The account to read.
-    /// @param actorId The actor identifier to resolve.
-    ///
-    /// @return target The stored policy manager.
-    /// @return commitment The stored policy commitment.
-    function getPolicy(address account, bytes32 actorId) external view returns (address target, bytes32 commitment) {
-        return (_policyManager[actorId][account], _policyCommitment[actorId][account]);
-    }
-
-    /// @notice Returns an actor's stored policy commitment.
-    ///
-    /// @dev Single SLOAD. Gating is determined by Scopes.POLICY, not by a non-zero commitment. Returns the raw slot
-    ///      after expiry; standalone readers should cross-check {getActorConfig}.
-    ///
-    /// @param account The account to read.
-    /// @param actorId The actor identifier to resolve.
-    ///
-    /// @return The stored policy commitment.
+    /// @notice The actor's policy commitment, or 0 when the actor is not live. Gating is by liveness (see
+    ///         {_resolveActorConfig}), not by a non-zero commitment, and costs one extra SLOAD over the raw slot.
     function getPolicyCommitment(address account, bytes32 actorId) external view returns (bytes32) {
+        if (_resolveActorConfig(account, actorId).authenticator == address(0)) {
+            return bytes32(0);
+        }
         return _policyCommitment[actorId][account];
     }
 
-    /// @notice Returns an actor's stored policy manager.
-    ///
-    /// @dev Single SLOAD. Returns the raw slot after expiry; standalone readers should cross-check {getActorConfig}.
-    ///
-    /// @param account The account to read.
-    /// @param actorId The actor identifier to resolve.
-    ///
-    /// @return The stored policy manager.
+    /// @notice The actor's policy manager, or 0 when the actor is not live. See {_resolveActorConfig}.
     function getPolicyManager(address account, bytes32 actorId) external view returns (address) {
+        if (_resolveActorConfig(account, actorId).authenticator == address(0)) {
+            return address(0);
+        }
         return _policyManager[actorId][account];
     }
 
