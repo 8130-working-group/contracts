@@ -292,6 +292,98 @@ contract AccountEnvironmentTest is KeystoreTest {
         assertEq(_multichainSeq(account), mcBefore + 1);
     }
 
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+    // MULTICHAIN — EXPIRY (channel-aware install-inert)
+    // ≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡
+
+    /// @notice A Multichain AuthorizeActor whose granted expiry is already in the past does NOT revert (unlike Local):
+    ///         it installs the actor inert and consumes the multichain sequence, so the slot stays replayable for a
+    ///         chain catching up. The actor is present (revocable) but not live.
+    function test_multichain_authorize_expiredInstallsInert(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+        uint64 mcBefore = _multichainSeq(account);
+
+        // Strictly-past expiry: this would be ExpiredChange on Local, but Multichain installs it inert.
+        uint48 pastExpiry = uint48(block.timestamp - 1);
+        _applyMultichain(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, pastExpiry, "")));
+
+        // Sequence consumed (no revert), yet the actor is not live (getActorConfig is expiry-aware).
+        assertEq(_multichainSeq(account), mcBefore + 1);
+        assertFalse(_isActor(account, ACTOR_A));
+
+        // It is nonetheless present: an explicit revoke succeeds (presence is checked without expiry), proving the
+        // slot was written rather than skipped. Reverts UnknownActor if the slot were empty.
+        _revokeActor(account, pk, ACTOR_A);
+    }
+
+    /// @notice New-chain catch-up: a chain onboarded late replays the full multichain history in order. Historical
+    ///         expiring grants (already expired at replay time) install inert and advance the counter instead of
+    ///         bricking it, so the final still-live grant lands and the chain converges. This is the core reason the
+    ///         Multichain channel does not fail-fast on expiry.
+    function test_multichain_authorize_expiredHistoryReplaysToLiveGrant(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+
+        // Onboarding "in year 3": every past yearly renewal is already expired; only the current grant is live.
+        uint48 expiredOld = uint48(block.timestamp - 2);
+        uint48 expiredMid = uint48(block.timestamp - 1);
+        uint48 liveNow = _future(365 days);
+
+        // seq 0 and seq 1: historical (expired) operator grants — inert, but each consumes its slot.
+        _applyMultichain(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, expiredOld, "")));
+        assertFalse(_isActor(account, ACTOR_A));
+        _applyMultichain(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, expiredMid, "")));
+        assertFalse(_isActor(account, ACTOR_A));
+
+        // seq 2: the current renewal is still live -> the operator is now authorized, converged with chains that
+        // applied the same history earlier.
+        _applyMultichain(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, liveNow, "")));
+
+        assertTrue(_isActor(account, ACTOR_A));
+        assertEq(keystore.getActorConfig(account, ACTOR_A).expiry, liveNow);
+        assertEq(_multichainSeq(account), 3); // all three slots consumed, gap-free
+    }
+
+    /// @notice Self-actor edge: an expired non-k1 self grant on the Multichain channel is handled like any other —
+    ///         installed inert (no revert) and consuming the sequence — so replay stays convergent. As with any non-k1
+    ///         self grant it also disables the inline k1 self (mutual exclusion); here that self is simply dead on
+    ///         arrival, matching the state a chain that applied it while live reaches once it expires.
+    function test_multichain_authorize_expiredSelfInstallsInert(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+        bytes32 selfActorId = bytes32(uint256(uint160(account)));
+        uint64 mcBefore = _multichainSeq(account);
+
+        // Signed by the (still-live at auth time) k1 self; installs an already-expired non-k1 self.
+        uint48 pastExpiry = uint48(block.timestamp - 1);
+        _applyMultichain(
+            pk, account, _one(_authorizeChange(selfActorId, address(p256Authenticator), SENDER, pastExpiry, ""))
+        );
+
+        // No revert; slot consumed. The non-k1 self is present but not live (expired).
+        assertEq(_multichainSeq(account), mcBefore + 1);
+        assertFalse(_isActor(account, selfActorId));
+    }
+
+    /// @notice A SEQUENCED local AuthorizeActor with an already-past expiry installs inert (like Multichain), not
+    ///         reverts: a sequenced batch is single-consume and cannot be replayed, so the expiry-bound-replay concern
+    ///         does not apply. The fail-fast is reserved for the replayable unsequenced (JIT) path (see
+    ///         test_authorizeUnsequenced_revert_pastExpiry in applyKeyChange.t.sol).
+    function test_local_sequenced_authorize_pastExpiry_installsInert(uint256 pk) public {
+        pk = _boundK1Pk(pk);
+        (address account,) = _createK1Account(pk);
+        uint64 seqBefore = _localSeqWord(account);
+
+        uint48 pastExpiry = uint48(block.timestamp - 1);
+        _applyLocal(pk, account, _one(_authorizeChange(ACTOR_A, address(k1Authenticator), SENDER, pastExpiry, "")));
+
+        // Sequence consumed (no revert); the actor is present but not live.
+        assertEq(_localSeqWord(account), seqBefore + 1);
+        assertFalse(_isActor(account, ACTOR_A));
+        _revokeActor(account, pk, ACTOR_A); // present -> explicit revoke succeeds (reverts UnknownActor if empty)
+    }
+
     /// @notice A Multichain IncrementLocalEpoch bumps the local epoch (resetting the local sequence) and consumes the
     ///         multichain counter, retiring outstanding unlanded local signatures without a Local batch.
     function test_multichain_success_bump(uint256 pk) public {
