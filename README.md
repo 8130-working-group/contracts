@@ -1,6 +1,6 @@
 # EIP-8130
 
-Reference implementation for [EIP-8130: Account Abstraction by Account Configuration](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-8130.md).
+Canonical implementation for [EIP-8130: Account Abstraction by Account Configuration](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-8130.md).
 
 > **Warning** — This is an active work in progress. The spec is changing and the code has not been audited. Do not use in production.
 
