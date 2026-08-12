@@ -35,7 +35,15 @@ import {RecurringAllowance} from "./RecurringAllowance.sol";
 ///          ERC-721 `safeTransferFrom`, any ERC-1155 transfer — therefore bypass the spend cap entirely if listed.
 ///          Do NOT allow such selectors on a token you are trying to bound; only `transfer`/`transferFrom`/`approve`
 ///          are tracked.
-///        - Native-ETH limits are consumed from each call's `value`, independent of calldata.
+///        - Native-ETH limits are consumed from each call's `value`, independent of calldata. Native value fails
+///          closed: a call carrying `value` reverts ({NativeValueNotAllowed}) unless the config pins a native
+///          {TokenLimit} (`token == address(0)`). Absence means "no ETH", not "unlimited ETH" — so a grant can call a
+///          value-accepting target while sending it zero ETH, and this does not depend on the target rejecting value.
+///          Note the resulting asymmetry with ERC-20 defaults is structural, not an oversight: an ERC-20 must be
+///          called at its own address to move, so the target allowlist already gates it (omit the token ⇒ "can't
+///          touch it") and an absent cap can safely mean "unlimited amount". Native value has no such target to omit,
+///          so it fails closed instead. Both assets share the same *expressible* states — forbidden, capped, and
+///          unlimited (`limit == type(uint160).max`) — only the meaning of an omitted entry differs.
 ///
 ///      Approvals vs. periods: `approve` is debited from the *current* period at grant time, but an ERC-20 allowance
 ///      is standing on-chain state that outlives the period and is pulled by a third party this policy never sees. A
@@ -44,7 +52,8 @@ import {RecurringAllowance} from "./RecurringAllowance.sol";
 ///      Per-period accounting is exact for the key's own actions; it cannot bound reuse of standing allowances.
 ///
 ///      Calldata length: empty calldata is allowed (a `receive()` / plain value transfer, gated by the target
-///      allowlist and native-ETH cap); calldata of 1–3 bytes is rejected ({MissingSelector}) as it cannot carry a
+///      allowlist and, when it carries `value`, a required native-ETH cap); calldata of 1–3 bytes is rejected
+///      ({MissingSelector}) as it cannot carry a
 ///      4-byte selector; 4+ bytes is treated as a selector (so a fallback reachable via 4+ byte data is gated by the
 ///      selector rules).
 contract SessionPolicy is Policy {
@@ -56,7 +65,8 @@ contract SessionPolicy is Policy {
     struct TokenLimit {
         /// @dev ERC-20 token address, or address(0) for native ETH (gated on each call's `value`).
         address token;
-        /// @dev Maximum spend per period (one-time: total cap). Must fit uint160.
+        /// @dev Maximum spend per period (one-time: total cap). Must fit uint160; 0 is rejected ({ZeroLimit}). To
+        ///      express an effectively unlimited budget, set `limit = type(uint160).max`.
         uint256 limit;
         /// @dev Recurring period in seconds. 0 = one-time (a single cumulative cap that never resets).
         uint40 period;
@@ -119,6 +129,11 @@ contract SessionPolicy is Policy {
     error LimitTooLarge(address token, uint256 limit);
     /// @notice A configured spend limit was zero, which would be a no-op cap; reject to fail closed.
     error ZeroLimit(address token);
+    /// @notice The action carried native `value` but the config pins no native-ETH limit (`token == address(0)`).
+    ///         Native value fails closed: unlike an ERC-20 (which requires calling an allowlisted token contract to
+    ///         move), value rides on any call to any allowlisted target, so an absent native limit is treated as "no
+    ///         ETH", not "unlimited ETH". To permit ETH, add a native {TokenLimit} with a positive cap.
+    error NativeValueNotAllowed(uint256 value);
     /// @notice A recipient allowlist was attached to a selector whose recipient argument this policy cannot decode
     ///         (only the standard ERC-20 selectors are supported).
     error RecipientRuleUnsupportedSelector(bytes4 selector);
@@ -295,10 +310,13 @@ contract SessionPolicy is Policy {
             revert MissingSelector();
         }
 
-        // 3b. Native-ETH spend limit: consume from the call value, independent of calldata.
+        // 3b. Native-ETH spend limit: consume from the call value, independent of calldata. Fail closed — value rides
+        // on any call to any allowlisted target (no token contract to allowlist as a gate), so an absent native limit
+        // means "no ETH", not "unlimited ETH". Permitting ETH requires an explicit native {TokenLimit}.
         if (action.value > 0) {
             (bool set, uint160 allowance, uint40 period) = _findTokenLimit(config, address(0));
-            if (set) _consume(commitment, address(0), allowance, period, action.value);
+            if (!set) revert NativeValueNotAllowed(action.value);
+            _consume(commitment, address(0), allowance, period, action.value);
         }
 
         Call[] memory calls = new Call[](1);
